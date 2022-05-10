@@ -19,7 +19,7 @@ class ThresholdCompressor(Compressor):
         ctx = shape, numel
         return [values, indices], ctx
 
-    def decompress(self, tensor_compressed, ctx):
+    def decompress(self, tensor_compressed, ctx, name):
         shape, numel = ctx
         values, indices = tensor_compressed
         tensor_decompressed = torch.zeros(numel, dtype=values.dtype, layout=values.layout, device=values.device)

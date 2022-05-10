@@ -7,6 +7,6 @@ class NoneCompressor(Compressor):
     def compress(self, tensor, name):
         return [tensor], None
 
-    def decompress(self, tensors, ctx):
+    def decompress(self, tensors, ctx, name):
         tensor, = tensors
         return tensor

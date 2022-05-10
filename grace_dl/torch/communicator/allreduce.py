@@ -10,6 +10,6 @@ class Allreduce(Communicator):
             handles.append(allreduce_async_(tensor_compressed, self.compressor.average, name + str(i)))
         return handles
 
-    def wait_receive(self, handles, ctx):
+    def wait_receive(self, handles, ctx, name):
         output = [synchronize(h) for h in handles]
         return self.compressor.decompress(output, ctx)

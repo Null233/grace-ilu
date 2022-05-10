@@ -14,7 +14,7 @@ class FP16Compressor(Compressor):
             tensor = tensor.type(torch.float16)
         return [tensor], dtype
 
-    def decompress(self, tensors, dtype):
+    def decompress(self, tensors, dtype, name):
         """Upcasts the tensor to the initialization dtype."""
         tensor_decompressed, = tensors
         if dtype.is_floating_point:

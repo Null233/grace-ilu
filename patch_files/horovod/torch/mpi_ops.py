@@ -217,7 +217,7 @@ def allreduce(tensor, average=None, name=None, compression=Compression.none, op=
     tensor_compressed, ctx = compression.compress(tensor)
     summed_tensor_compressed = HorovodAllreduce.apply(tensor_compressed, average, name, op,
                                                       prescale_factor, postscale_factor)
-    return compression.decompress(summed_tensor_compressed, ctx)
+    return compression.decompress(summed_tensor_compressed, ctx, name)
 
 
 def allreduce_async_(tensor, average=None, name=None, op=None,
@@ -428,7 +428,7 @@ def grouped_allreduce(tensors, average=None, name=None, compression=Compression.
     summed_tensors_compressed = HorovodGroupedAllreduce.apply(average, name, op,
                                                               prescale_factor, postscale_factor,
                                                               *tensors_compressed)
-    return [compression.decompress(t, ctx) for t, ctx in zip(summed_tensors_compressed, ctxs)]
+    return [compression.decompress(t, ctx, name) for t, ctx in zip(summed_tensors_compressed, ctxs)]
 
 
 def grouped_allreduce_async_(tensors, average=None, name=None, op=None,

@@ -29,7 +29,7 @@ class TopKCompressor(Compressor):
         ctx = tensor.numel(), tensor.size()
         return tensors, ctx
 
-    def decompress(self, tensors, ctx):
+    def decompress(self, tensors, ctx, name):
         """Decompress by filling empty slots with zeros and reshape back using the original shape"""
         numel, shape = ctx
         tensor_decompressed = desparsify(tensors, numel)

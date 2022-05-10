@@ -15,7 +15,7 @@ class SignSGDCompressor(Compressor):
         tensor_compressed = tensor >= 0
         return [tensor_compressed.type(torch.uint8)], shape
 
-    def decompress(self, tensors, shape):
+    def decompress(self, tensors, shape, name):
         """Decoding the signs to float format """
         sign_encode, = tensors
         sign_decode = sign_encode.type(torch.float32) * 2 - 1

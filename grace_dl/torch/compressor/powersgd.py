@@ -48,7 +48,7 @@ class PowerSGDCompressor(Compressor):
         self.q_memory[name] = q
         return [], ctx
 
-    def decompress(self, tensors, ctx):
+    def decompress(self, tensors, ctx, name):
         if ctx is None:
             tensor, = tensors
             return tensor

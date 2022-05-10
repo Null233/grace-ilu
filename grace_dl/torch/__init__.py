@@ -25,7 +25,7 @@ class Compressor(ABC):
         raise NotImplemented("compress was not implemented.")
 
     @abstractmethod
-    def decompress(self, tensors, ctx):
+    def decompress(self, tensors, ctx, name):
         """Decompress the tensor with the given context."""
         raise NotImplemented("decompress was not implemented.")
 
@@ -40,7 +40,7 @@ class Communicator(ABC):
         raise NotImplemented("async_send was not implemented.")
 
     @abstractmethod
-    def wait_receive(self, handles, ctx):
+    def wait_receive(self, handles, ctx, name):
         raise NotImplemented("wait_receive was not implemented.")
 
     def __init__(self, compressor, memory):
@@ -55,4 +55,4 @@ class Communicator(ABC):
         return handles, ctx
 
     def receive_step(self, handles, ctx):
-        return self.wait_receive(handles, ctx)
+        return self.wait_receive(handles, ctx, name)

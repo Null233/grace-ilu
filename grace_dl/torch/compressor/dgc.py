@@ -42,7 +42,7 @@ class DgcCompressor(Compressor):
         ctx = shape, mask, numel
         return tensor_compressed, ctx
 
-    def decompress(self, tensor_compressed, ctx):
+    def decompress(self, tensor_compressed, ctx, name):
         values, indices = tensor_compressed
         shape, _, numel = ctx
         tensor_decompressed = torch.zeros(numel, dtype=values.dtype, layout=values.layout, device=values.device)

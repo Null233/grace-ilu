@@ -30,7 +30,7 @@ class QSGDCompressor(Compressor):
 
         return tensor_compressed, shape
 
-    def decompress(self, tensor_compressed, shape):
+    def decompress(self, tensor_compressed, shape, name):
         tensor_compressed, norm = tensor_compressed
 
         decode_output = tensor_compressed.type(torch.float32)

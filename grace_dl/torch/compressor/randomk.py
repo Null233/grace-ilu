@@ -31,7 +31,7 @@ class RandomKCompressor(Compressor):
         ctx = indices, tensor.numel(), tensor.size()
         return [values], ctx
 
-    def decompress(self, tensors, ctx):
+    def decompress(self, tensors, ctx, name):
         """Decompress by filling empty slots with zeros and reshape back using the original shape"""
         indices, numel, shape = ctx
         values, = tensors

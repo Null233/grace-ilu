@@ -17,7 +17,7 @@ class Broadcast(Communicator):
             handles.append(rank_handles)
         return handles
 
-    def wait_receive(self, handles, ctx):
+    def wait_receive(self, handles, ctx, name):
         tensors_decompressed = []
         for ranki in handles:
             tensors_compressed = [synchronize(h) for h in ranki]

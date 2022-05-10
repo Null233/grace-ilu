@@ -34,4 +34,4 @@ class PowerSGDMemory(Memory):
         if ctx is None:
             return
 
-        self.residuals[name] = tensor - compressor.decompress(tensor_compressed, ctx)
+        self.residuals[name] = tensor - compressor.decompress(tensor_compressed, ctx, name)

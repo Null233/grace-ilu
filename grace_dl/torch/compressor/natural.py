@@ -29,7 +29,7 @@ class NaturalCompressor(Compressor):
         return [from_dlpack(tensor_compressed.toDlpack())], shape
 
 
-    def decompress(self, tensor_compressed, shape):
+    def decompress(self, tensor_compressed, shape, name):
         tensor_compressed, = tensor_compressed
         cupy_tensor = cupy.fromDlpack(to_dlpack(tensor_compressed))
         sign = cupy_tensor > 127

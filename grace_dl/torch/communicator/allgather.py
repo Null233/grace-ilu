@@ -36,7 +36,7 @@ class Allgather(Communicator):
 
         return handles, tensor_sizes
 
-    def wait_receive(self, result, ctx):
+    def wait_receive(self, result, ctx, name):
         handles, tensor_sizes = result
         tensors_ag = []
         for handle, sizes in zip(handles, tensor_sizes):

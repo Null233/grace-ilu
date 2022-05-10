@@ -15,6 +15,6 @@ class ResidualMemory(Memory):
 
     def update(self, tensor, name, compressor, tensor_compressed, ctx):
         """Update the residuals."""
-        tensor_decompressed = compressor.decompress(tensor_compressed, ctx)
+        tensor_decompressed = compressor.decompress(tensor_compressed, ctx, name)
         residual = tensor - tensor_decompressed
         self.residuals[name] = residual

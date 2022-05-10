@@ -53,6 +53,9 @@ def grace_from_params(params):
         from grace_dl.torch.compressor.topk import TopKCompressor
         compress_ratio = params.get('compress_ratio', 0.3)
         compressor = TopKCompressor(compress_ratio)
+    elif comp == 'ternallreduce':
+        from grace_dl.torch.compressor.ternallreduce import TernCompressor
+        compressor = TernCompressor()
     else:
         raise NotImplementedError(comp)
 
@@ -75,6 +78,9 @@ def grace_from_params(params):
         from grace_dl.torch.memory.efsignsgd import EFSignSGDMemory
         lr = params.get('lr', 0.1)
         memory = EFSignSGDMemory(lr)
+    elif mem == 'ternallreduce':
+        from grace_dl.torch.memory.ternallreduce import TernMemory
+        memory = TernMemory()
     else:
         raise NotImplementedError(mem)
 

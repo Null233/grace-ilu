@@ -25,7 +25,7 @@ class TernGradCompressor(Compressor):
 
         return tensor_compressed, shape
 
-    def decompress(self, tensor_compressed, shape):
+    def decompress(self, tensor_compressed, shape, name):
         tensor_compressed, scalar = tensor_compressed
         sign = tensor_compressed.type(torch.float32)
         tensor_decompressed = sign * scalar

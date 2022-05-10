@@ -20,7 +20,7 @@ class EFSignSGDCompressor(Compressor):
 
         return tensor_compressed, shape
 
-    def decompress(self, tensor_compressed, shape):
+    def decompress(self, tensor_compressed, shape, name):
         """Decoding the signs to float format """
         mean, sign_encode = tensor_compressed
         sign_decode = sign_encode.type(torch.float32) * 2 - 1
