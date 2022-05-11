@@ -56,3 +56,6 @@ class Communicator(ABC):
 
     def receive_step(self, handles, ctx):
         return self.wait_receive(handles, ctx, name)
+
+class Scheduler(ABC):
+    @abstractmethod
