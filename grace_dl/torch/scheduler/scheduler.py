@@ -11,11 +11,11 @@ from horovod.torch.functions import broadcast_object
 from horovod.torch.mpi_ops import size, rank
 from horovod.torch.mpi_ops import Average
 from horovod.torch import Compression
+from grace_dl.torch.optimizer_basic import _DistributedOptimizer, DistributedOptimizer
 
 #from grace_dl.torch import 
 
-_DistributedOptimizer = hvd._DistributedOptimizer
-_hvd_DistributedOptimizer = hvd.DistributedOptimizer
+_hvd_DistributedOptimizer = DistributedOptimizer
 
 class _Scheduled_Optimizer(_DistributedOptimizer):
     def __init__(self, model, hvd_opt, num_steps=10**6):
@@ -36,23 +36,20 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for p in param_group['params']:
                 self._locks[p] = threading.Lock()
 
-        if size() > 1:
-            self._register_forward_hooks()
-            self._register_hooks()
+        #if size() > 1:
+        self._register_forward_hooks()
+        self._register_hooks()
 
-            # Poll whether the tensor push-pull is finished.
-            self._event_queue = queue.Queue()
-            self._poller = threading.Thread(target=self._poll, args=())
-            self._poller.start()
+        # Poll whether the tensor push-pull is finished.
+        #self._event_queue = queue.Queue()
+        #self._poller = threading.Thread(target=self._poll, args=())
+        #self._poller.start()
 
     def __getattr__(self, item):
         return getattr(self._opt, item)
 
     def _get_parameter_name(self, p):
-        if self._is_tensor_instance:
-            name = self._parameter_names.get(p.__hash__())
-        else:
-            name = self._parameter_names.get(p)
+        name = self._parameter_names.get(p)
         return name
 
     def _make_hook(self, p):
@@ -74,43 +71,17 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             with self._locks[p]:
                 self._logger.debug("{} {} finished backward.".format(self._desc, self._get_parameter_name(p)))
 
+    def zero_grad(self):
+        """Override the default zero_grad function.
+        Clears the gradients of all optimized tensors.
+        """
+        self._logger.debug("{} calls zero_grad() of step {}".format(self._desc, self._step))
+        if size() > 1 and self._step > 0:
+            return
+        else:
+            self._opt.zero_grad()
 
     def _register_hook(self):
-        if self._groups is not None:
-            p_list = []
-            # Get list of parameters with grads
-            for param_group in self.param_groups:
-                for p in param_group['params']:
-                    if p.requires_grad:
-                        p_list.append(p)
-
-            # To ensure parameter order and group formation is consistent, broadcast p_list order
-            # from rank 0 and use for every worker
-            p_list_names = [self._parameter_names.get(p) for p in p_list]
-            p_list_names = broadcast_object(p_list_names, root_rank=0)
-            p_list = sorted(p_list, key=lambda p: p_list_names.index(self._parameter_names.get(p)))
-
-            # Form groups
-            if isinstance(self._groups, list):
-                p_groups = []
-                grouped_id = set()
-                p_list_ids = [id(p) for p in p_list]
-                for group in self._groups:
-                    p_groups.append([p for p in group if id(p) in p_list_ids])
-                    for p in p_groups[-1]:
-                        grouped_id.add(id(p))
-                for p in p_list:
-                    if id(p) not in grouped_id:
-                        p_groups.append([p])
-            else:
-                p_groups = split_list(p_list, self._groups)
-
-            p_groups = [tuple(p) for p in p_groups]
-            for group in p_groups:
-                for p in group:
-                    self._p_to_group[p] = group
-                self._group_counts[group] = 0
-
         for param_group in self.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:

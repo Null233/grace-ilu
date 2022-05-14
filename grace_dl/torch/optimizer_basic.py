@@ -75,8 +75,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._synchronized = False
         self._should_synchronize = True
 
-        #if size() > 1 or os.environ.get('HOROVOD_ELASTIC') == '1':
-        #    self._register_hooks()
+        """if size() > 1 or os.environ.get('HOROVOD_ELASTIC') == '1':
+            self._register_hooks()"""
         self._register_hooks()
 
     def load_state_dict(self, *args, **kwargs):
@@ -120,7 +120,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         name = self._parameter_names.get(p)
         tensor = p.grad
-        tensor_compressed, ctx = self._compression.compress(tensor, name)
+        tensor_compressed, ctx = self._compression.compress(tensor)
 
         if self.op == Average:
             # Split average operation across pre/postscale factors
@@ -175,13 +175,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 outputs = synchronize(handle)
                 for gp, output, gctx in zip(p, outputs, ctx):
                     self._allreduce_delay[gp] = self.backward_passes_per_step
-                    gp.grad.set_(self._compression.decompress(output, gctx, self._parameter_names.get(p)))
+                    gp.grad.set_(self._compression.decompress(output, gctx))
             else:
                 # When handle is a callable function, it returns the aggregated tensor result
                 output = synchronize(handle) if not callable(handle) else handle()
                 self._allreduce_delay[p] = self.backward_passes_per_step
                 # Basic Synchronization Method
-                p.grad.set_(self._compression.decompress(output, ctx, self._parameter_names.get(p)))
+                p.grad.set_(self._compression.decompress(output, ctx))
         self._handles.clear()
 
         self._synchronized = True
@@ -231,8 +231,7 @@ def DistributedOptimizer(optimizer, named_parameters=None,
                          compression=Compression.none,
                          backward_passes_per_step=1,
                          op=Average,
-                         gradient_predivide_factor=1.0,
-                         groups=None):
+                         gradient_predivide_factor=1.0):
     """
     An optimizer that wraps another torch.optim.Optimizer, using an allreduce to
     combine gradient values before applying gradients to model weights.
@@ -275,16 +274,6 @@ def DistributedOptimizer(optimizer, named_parameters=None,
                                    before and after the sum. Gradients are scaled by
                                    1.0 / gradient_predivide_factor before the sum and
                                    gradient_predivide_factor / size after the sum.
-        num_groups: Number of groups to assign gradient allreduce ops to for explicit
-                    grouping. Defaults to no explicit groups.
-        groups: The parameter to group the gradient allreduce ops. Accept values is a
-                non-negative integer or a list of list of torch.Tensor.
-                If groups is a non-negative integer, it is the number of groups to assign
-                gradient allreduce ops to for explicit grouping.
-                If groups is a list of list of torch.Tensor. Tensors in the same
-                inner list will be assigned to the same group, while parameter that does
-                not appear in any list will form a group itself.
-                Defaults as None, which is no explicit groups.
     """
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override the `step()` method with an allreduce implementation.
@@ -299,4 +288,4 @@ def DistributedOptimizer(optimizer, named_parameters=None,
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                 dict(_DistributedOptimizer.__dict__))
     return cls(optimizer.param_groups, named_parameters, compression, backward_passes_per_step, op,
-                gradient_predivide_factor, groups)
+                gradient_predivide_factor)
