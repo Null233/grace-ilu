@@ -226,7 +226,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             else:
                 if self._grace and self._num_groups == 0 and self.op == Average:
                     # in GRACE, p is not tuple, but handle is.
-                    output = self._grace.receive_step(handle, ctx)
+                    output = self._grace.receive_step(handle, ctx, name)
                     self._allreduce_delay[p] = self.backward_passes_per_step
                     p.grad.set_(output)
                 else:

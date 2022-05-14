@@ -14,20 +14,17 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 import warnings
 
 from contextlib import contextmanager
 
 import torch
 
-from horovod.common.util import split_list
 from horovod.torch.compression import Compression
-from horovod.torch.functions import broadcast_object
 from horovod.torch.mpi_ops import allreduce_async_
 from horovod.torch.mpi_ops import synchronize
 from horovod.torch.mpi_ops import size
-from horovod.torch.mpi_ops import Average, Adasum
+from horovod.torch.mpi_ops import Average
 from horovod.torch.mpi_ops import rocm_built
 
 class _DistributedOptimizer(torch.optim.Optimizer):

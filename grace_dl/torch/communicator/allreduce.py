@@ -12,4 +12,4 @@ class Allreduce(Communicator):
 
     def wait_receive(self, handles, ctx, name):
         output = [synchronize(h) for h in handles]
-        return self.compressor.decompress(output, ctx)
+        return self.compressor.decompress(output, ctx, name)

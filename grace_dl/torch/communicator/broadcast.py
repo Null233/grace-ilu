@@ -21,7 +21,7 @@ class Broadcast(Communicator):
         tensors_decompressed = []
         for ranki in handles:
             tensors_compressed = [synchronize(h) for h in ranki]
-            tensor_decompressed = self.compressor.decompress(tensors_compressed, ctx)
+            tensor_decompressed = self.compressor.decompress(tensors_compressed, ctx, name)
             tensors_decompressed.append(tensor_decompressed)
         tensor_aggregated = self.compressor.aggregate(tensors_decompressed)
         return (tensor_aggregated / self.world_size) if self.compressor.average else tensor_aggregated

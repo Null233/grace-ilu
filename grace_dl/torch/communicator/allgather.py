@@ -46,7 +46,7 @@ class Allgather(Communicator):
         # time.sleep(0.001)
         list_tensor_decompressed = []
         for tensor_compressed in zip(*tensors_ag):
-            tensor_decompressed = self.compressor.decompress(tensor_compressed, ctx)
+            tensor_decompressed = self.compressor.decompress(tensor_compressed, ctx, name)
             list_tensor_decompressed.append(tensor_decompressed)
 
         tensors_aggregated = self.compressor.aggregate(list_tensor_decompressed)

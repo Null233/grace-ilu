@@ -54,8 +54,8 @@ class Communicator(ABC):
         handles = self.async_send(tensors_compressed, name)
         return handles, ctx
 
-    def receive_step(self, handles, ctx):
+    def receive_step(self, handles, ctx, name):
         return self.wait_receive(handles, ctx, name)
 
-class Scheduler(ABC):
-    @abstractmethod
+"""class Scheduler(ABC):
+    @abstractmethod"""
