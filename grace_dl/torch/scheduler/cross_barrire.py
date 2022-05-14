@@ -4,9 +4,6 @@ try:
     import queue
 except ImportError:
     import Queue as queue
-import time
-import math
-import torch
 import horovod.torch as hvd
 
 from horovod.common.util import split_list
