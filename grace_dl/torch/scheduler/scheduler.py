@@ -182,7 +182,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 handle, ctx = self._push_pull_grad_async(p)
                 self._handles[p] = (handle, ctx)
 
-    """Below are hooks used in forward propagation and backware propaagtion"""
+    """Below are hooks used in forward propagation and backward propaagtion"""
 
     def _make_hook(self, p):
         def hook(*ignore):
