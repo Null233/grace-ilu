@@ -15,6 +15,7 @@
 # ==============================================================================
 
 import warnings
+import os
 
 from contextlib import contextmanager
 
@@ -38,9 +39,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         if named_parameters is not None:
             named_parameters = list(named_parameters)
         else:
-            named_parameters = [(f'allreduce.noname.{i}.{j}', v)
-                                for i, param_group in enumerate(self.param_groups)
-                                for j, v in enumerate(param_group['params'])]
+            named_parameters = []
         # make sure that named_parameters are tuples
         if any([not isinstance(p, tuple) for p in named_parameters]):
             raise ValueError('named_parameters should be a sequence of '
@@ -61,8 +60,28 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             raise ValueError('named_parameters was specified, but one or more model '
                              'parameters were not named. Python object ids: '
                              '%s' % ', '.join(str(id) for id in unnamed_param_ids))
+                             
+        if len(named_parameters) > 0:
+            if isinstance(named_parameters[0][1], torch.Tensor):
+                if any([not isinstance(p, torch.Tensor) for name, p in named_parameters]):
+                    raise ValueError('named_parameters should consistently be a sequence of '
+                                     'tuples (name, torch.Tensor)')
+                self._is_tensor_instance = True
+                # there is an issue when using torch.Tensor as key, so use its hash instead
+                # https://github.com/pytorch/pytorch/issues/7733
+                self._parameter_names = {v.__hash__(): k for k, v
+                                         in sorted(named_parameters)}
+                self._tensor_list = [tensor for name, tensor in named_parameters]
+            else:
+                self._is_tensor_instance = False
+                self._parameter_names = {v: k for k, v
+                                         in sorted(named_parameters)}
+        else:
+            self._is_tensor_instance = False
+            self._parameter_names = {v: 'allreduce.noname.%s' % i
+                                     for param_group in self.param_groups
+                                     for i, v in enumerate(param_group['params'])}
 
-        self._parameter_names = {v: k for k, v in sorted(named_parameters)}
         self.backward_passes_per_step = backward_passes_per_step
         self._allreduce_delay = {v: self.backward_passes_per_step
                                  for _, v in sorted(named_parameters)}
@@ -75,9 +94,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._synchronized = False
         self._should_synchronize = True
 
-        """if size() > 1 or os.environ.get('HOROVOD_ELASTIC') == '1':
-            self._register_hooks()"""
-        self._register_hooks()
+        if size() > 1 or os.environ.get('HOROVOD_ELASTIC') == '1':
+            self._register_hooks()
 
     def load_state_dict(self, *args, **kwargs):
         self._handles = {}

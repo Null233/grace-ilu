@@ -4,16 +4,20 @@ try:
     import queue
 except ImportError:
     import Queue as queue
-import horovod.torch as hvd
+import time
+import os
+import math
+import torch
 
-from horovod.common.util import split_list
-from horovod.torch.functions import broadcast_object
+from horovod.torch.compression import Compression
 from horovod.torch.mpi_ops import size, rank
 from horovod.torch.mpi_ops import Average
-from horovod.torch import Compression
-from grace_dl.torch.optimizer_basic import _DistributedOptimizer, DistributedOptimizer
+from horovod.torch.mpi_ops import allreduce_async_
+from horovod.torch.mpi_ops import synchronize
+from horovod.torch.mpi_ops import size
+from horovod.torch.mpi_ops import Average
 
-#from grace_dl.torch import 
+from grace_dl.torch.optimizer_basic import _DistributedOptimizer, DistributedOptimizer
 
 _hvd_DistributedOptimizer = DistributedOptimizer
 
@@ -23,8 +27,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._model = model
         self._opt = hvd_opt
 
-        self._logger = logging.getLogger("CrossBarrier")
-        self._logger.info("CrossBarrier is enabled.")
+        self._logger = logging.getLogger("Scheduler")
+        self._logger.info("Scheduler is enabled.")
         self._logger.debug(" size {}, rank {}".format(size(), rank()))
         self._desc = "rank {}".format(rank())
 
@@ -40,10 +44,12 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._register_forward_hooks()
         self._register_hooks()
 
-        # Poll whether the tensor push-pull is finished.
-        #self._event_queue = queue.Queue()
-        #self._poller = threading.Thread(target=self._poll, args=())
-        #self._poller.start()
+        # Poll whether the tensor allreduce is finished.
+        self._event_queue = queue.Queue()
+        self._poller = threading.Thread(target=self._poll, args=())
+        self._poller.start()
+
+    """Below are helper methods"""
 
     def __getattr__(self, item):
         return getattr(self._opt, item)
@@ -52,9 +58,135 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         name = self._parameter_names.get(p)
         return name
 
+    """Overwrite zero_grad function in horovod._DistributedOptimizer"""
+
+    def zero_grad(self):
+        """Override the default zero_grad function.
+        Clears the gradients of all optimized tensors.
+        """
+        self._logger.debug("{} calls zero_grad() of step {}".format(self._desc, self._step))
+        if size() > 1 and self._step > 0:
+            return
+        else:
+            self._opt.zero_grad()
+
+    def _zero_one_grad(self, p):
+        """Clears the gradient of one variable as torch accumulates gradients by default.
+        Arguments:
+            p: the parameter.
+        """
+        if p.grad is not None:
+            p.grad.detach_()
+            p.grad.zero_()
+
+    """Below are actual communication methods"""
+
+    def step(self, closure=None):
+        """Override the default step function."""
+        self._logger.debug("{} calls step() {}".format(self._desc, self._step))
+
+        # Step 0 is called for parameter initialization after parameter broadcast
+        if size() > 1 and self._step > 0:
+            self._synchronize()
+            # if it is the final training step, wait for the completion of all tensors
+            if self._step == self._final_step:
+                self._logger.debug("final step {}, waiting for allreduce completion.".format(self._final_step))
+                while not self._event_queue.empty():
+                    sleep_time = os.environ.get('SCHEDULER_INTERVAL')
+                    if sleep_time is None:
+                        sleep_time = 0.001
+                    time.sleep(sleep_time)
+                self._event_queue.put((None, None, None))
+                self._poller.join()
+                self._logger.info("training finished!")
+            loss = None
+            if closure is not None:
+                loss = closure()
+            self._step += 1
+            return loss
+        else:
+            # Optimizer.step() will be triggered when user calls byteps.broadcast_optimizer_sate()
+            super(self._opt.__class__, self._opt).step()
+            self._step += 1
+
+    def _scheduled_allreduce_grad_async(self, p):
+        """Call Horovod API to allreduce gradient asynchronously
+        Arguments:
+            tensor: The tensor to allreduce.
+            name: The name of the tensor.
+        Returns:
+            an allreduce handle and context
+        """
+        name = self._get_parameter_name(p)
+        tensor = p.grad
+        tensor_compressed, ctx = self._compression.compress(tensor)
+
+        if self.op == Average:
+            # Split average operation across pre/postscale factors
+            # C++ backend will apply additional 1 / size() factor to postscale_factor for op == Average.
+            # Above division process will be performed in operations.cc at line 1030 
+            prescale_factor = 1.0 / self.gradient_predivide_factor
+            postscale_factor = self.gradient_predivide_factor
+        else:
+            prescale_factor = 1.0
+            postscale_factor = 1.0
+
+        self._locks[p].acquire()
+        handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
+                                  prescale_factor=prescale_factor,
+                                  postscale_factor=postscale_factor)
+        self._logger.debug("{} calls allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
+        # Add to queue to poll completion
+        self._event_queue.put((p, handle, ctx))
+        return handle, ctx
+
+    def _poll(self):
+        """Poll the completion of the tensor's backward or allreduce from a FIFO event_queue"""
+        while True:
+            p, handle, ctx = self._event_queue.get()
+            if p is None:
+                self._logger.debug("poller exits.")
+                break
+            # Check whether the allreduce is finished. If so, start updating parameters.
+            if handle is not None and poll(handle):
+                output = synchronize(handle)
+                p.grad.set_(self._compression.decompress(output, ctx))
+                self._logger.debug("{} {} finished allreduce".format(self._desc, self._get_parameter_name(p)))
+                self._allreduce_delay[p] = self.backward_passes_per_step
+                # So only support SGD, Adam and RMSprop optimizers in torch
+                if isinstance(self._opt, torch.optim.SGD):
+                    self._sgd(p)
+                elif isinstance(self._opt, torch.optim.Adam):
+                    self._adam(p)
+                elif isinstance(self._opt, torch.optim.RMSprop):
+                    self._rmsprop(p)
+                else:
+                    raise ValueError("Invalid optimizer! Only support SGD, Adam and RMSprop.")
+                self._zero_one_grad(p)
+                # notify update completion and parameter is ready for forward propagation
+                if p in self._locks:
+                    self._locks[p].release()
+            else:
+                self._event_queue.put((p, handle, ctx))
+
+    def _synchronize(self):
+        """Push pull missing parameters"""
+        missing_p = self._requires_update - set(self._handles.keys())
+        for p in missing_p:
+            handle, ctx = self._push_pull_grad_async(p)
+            self._handles[p] = (handle, ctx)
+
+        for p, value in self._handles.items():
+            handle, ctx = value
+            if handle is None:
+                handle, ctx = self._push_pull_grad_async(p)
+                self._handles[p] = (handle, ctx)
+
+    """Below are hooks used in forward propagation and backware propaagtion"""
+
     def _make_hook(self, p):
         def hook(*ignore):
-            """if p in self._handles and self._handles[p][0] is not None:
+            if p in self._handles and self._handles[p][0] is not None:
                 if self._allreduce_delay[p] <= 0:
                     raise AssertionError(
                         "Gradients were computed more than "
@@ -67,19 +199,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._allreduce_delay[p] -= 1
             if self._allreduce_delay[p] == 0:
                 handle, ctx = self._scheduled_allreduce_grad_async(p)
-            self._handles[p] = (handle, ctx)"""
+            self._handles[p] = (handle, ctx)
             with self._locks[p]:
                 self._logger.debug("{} {} finished backward.".format(self._desc, self._get_parameter_name(p)))
-
-    def zero_grad(self):
-        """Override the default zero_grad function.
-        Clears the gradients of all optimized tensors.
-        """
-        self._logger.debug("{} calls zero_grad() of step {}".format(self._desc, self._step))
-        if size() > 1 and self._step > 0:
-            return
-        else:
-            self._opt.zero_grad()
 
     def _register_hook(self):
         for param_group in self.param_groups:
@@ -92,7 +214,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     self._grad_accs.append(grad_acc)
 
     def _register_forward_hooks(self):
-        """Add hook before forward propagation of each layer to block forward computation until the push-pull and
+        """Add hook before forward propagation of each layer to block forward computation until the allreduce and
         parameter update is finished. The blocking is implemented using a lock."""
         # Recursively find all submodules
         submodules = []
@@ -127,20 +249,169 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             mod.register_forward_pre_hook(pre_forward_hook)
             mod.register_forward_hook(after_forward_hook)
 
+    """Below are the implementations of optimizers, e.g., SGD, Adam, RMSprop.
+    The implementation is derived from Torch's code, except that we update one parameter each time."""
+
+    def _sgd(self, p):
+        """Performs a single optimization step using SGD optimizer on a parameter.
+        Arguments:
+            p: The parameter to be updated.
+        """
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+
+            for gp in group['params']:
+                if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                if weight_decay != 0:
+                    d_p.add_(weight_decay, p.data)
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
+                        buf.mul_(momentum).add_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+                p.data.add_(-group['lr'], d_p)
+                break
+
+    def _adam(self, p):
+        """Performs a single optimization step using Adam optimizer on a parameter.
+        Arguments:
+            p: The parameter to be updated.
+        """
+        for group in self.param_groups:
+            for gp in group['params']:
+                if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+                amsgrad = group['amsgrad']
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p.data)
+
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    if amsgrad:
+                        # Maintains max of all exp. moving avg. of sq. grad. values
+                        state['max_exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                if amsgrad:
+                    max_exp_avg_sq = state['max_exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                state['step'] += 1
+
+                if group['weight_decay'] != 0:
+                    grad.add_(group['weight_decay'], p.data)
+
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                if amsgrad:
+                    # Maintains the maximum of all 2nd moment running avg. till now
+                    torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+
+                    # Use the max. for normalizing running avg. of gradient
+                    denom = max_exp_avg_sq.sqrt().add_(group['eps'])
+                else:
+                    denom = exp_avg_sq.sqrt().add_(group['eps'])
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+
+                p.data.addcdiv_(-step_size, exp_avg, denom)
+                break
+
+    def _rmsprop(self, p):
+        """Performs a single optimization step using RMSprop optimizer on a parameter.
+        Arguments:
+            p: The parameter to be updated.
+        """
+        for group in self.param_groups:
+            for gp in group['params']:
+                if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('RMSprop does not support sparse gradients')
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['square_avg'] = torch.zeros_like(p.data)
+                    if group['momentum'] > 0:
+                        state['momentum_buffer'] = torch.zeros_like(p.data)
+                    if group['centered']:
+                        state['grad_avg'] = torch.zeros_like(p.data)
+
+                square_avg = state['square_avg']
+                alpha = group['alpha']
+
+                state['step'] += 1
+
+                if group['weight_decay'] != 0:
+                    grad = grad.add(group['weight_decay'], p.data)
+
+                square_avg.mul_(alpha).addcmul_(1 - alpha, grad, grad)
+
+                if group['centered']:
+                    grad_avg = state['grad_avg']
+                    grad_avg.mul_(alpha).add_(1 - alpha, grad)
+                    avg = square_avg.addcmul(-1, grad_avg, grad_avg).sqrt().add_(group['eps'])
+                else:
+                    avg = square_avg.sqrt().add_(group['eps'])
+
+                if group['momentum'] > 0:
+                    buf = state['momentum_buffer']
+                    buf.mul_(group['momentum']).addcdiv_(grad, avg)
+                    p.data.add_(-group['lr'], buf)
+                else:
+                    p.data.addcdiv_(-group['lr'], grad, avg)
+                break
+
 
 def _init_logger():
-    logger = logging.getLogger("CrossBarrier")
+    logger = logging.getLogger("Scheduler")
     formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(filename)s:%(lineno)s %(levelname)s: %(message)s',
                                   '%H:%M:%S')
     sh = logging.StreamHandler()
     sh.setFormatter(formatter)
     logger.addHandler(sh)
-    fh = logging.FileHandler('cross_barrier.log', 'w')
+    fh = logging.FileHandler('scheduler.log', 'w')
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.INFO)
-
+    logger.setLevel(logging.DEBUG)
 
 def _init_bsc():
     """Replace _register_hook() function in _DistributedOptimizer with empty function."""
@@ -165,7 +436,7 @@ def Scheduled_Optimizer(model,
                          num_groups=0, groups=None,
                          sparse_as_dense=False,
                          num_steps=10**6):
-    """Wrap Torch optimizer using BytePS DistributedOptimizer and _CrossBarrier."""
+    """Wrap Torch optimizer using Horovod DistributedOptimizer and _Scheduler."""
     hvd_opt = _hvd_DistributedOptimizer(optimizer, named_parameters, compression, backward_passes_per_step)
     return _Scheduled_Optimizer(model, hvd_opt, num_steps)
 

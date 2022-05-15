@@ -3,3 +3,4 @@ pytorch_mnist.py
 __pycache__
 data-0
 data-1
+*.log
