@@ -13,9 +13,8 @@ from horovod.torch.compression import Compression
 from horovod.torch.mpi_ops import size, rank
 from horovod.torch.mpi_ops import Average
 from horovod.torch.mpi_ops import allreduce_async_
-from horovod.torch.mpi_ops import synchronize
+from horovod.torch.mpi_ops import synchronize, poll
 from horovod.torch.mpi_ops import size
-from horovod.torch.mpi_ops import Average
 
 from grace_dl.torch.optimizer_basic import _DistributedOptimizer, DistributedOptimizer
 
