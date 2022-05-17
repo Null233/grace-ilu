@@ -139,6 +139,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._event_queue.put((p, handle, ctx))
         return handle, ctx
 
+    """TODO: Change handle manipulating process to one tensor with multiple handles"""
     def _poll(self):
         """Poll the completion of the tensor's backward or allreduce from a FIFO event_queue"""
         while True:
@@ -180,6 +181,20 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             if handle is None:
                 handle, ctx = self._push_pull_grad_async(p)
                 self._handles[p] = (handle, ctx)
+
+    """Below are tensor clipping and aggregation"""
+
+    def _tensor_clipping(self, p):
+        """Called when tensor arrives at _scheduled_allreduce_grad_async()
+           to clip tensor into multiple tensors based on SIZE.
+           Each clipped tensor has its own handle.
+           Clipped tensors will be aggregated in _poll()"""
+        tensor = p.grad
+
+    def _tensor_aggregation(self, p):
+        name = self._get_parameter_name(p)
+        handle = 
+
 
     """Below are hooks used in forward propagation and backward propagation"""
 
