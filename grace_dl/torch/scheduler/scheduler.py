@@ -39,14 +39,19 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for p in param_group['params']:
                 self._locks[p] = threading.Lock()
 
-        #if size() > 1:
-        self._register_forward_hooks()
-        self._register_hooks()
+        if size() > 1:
+            self._register_forward_hooks()
+            self._register_hooks()
 
-        # Poll whether the tensor allreduce is finished.
-        self._event_queue = queue.Queue()
-        self._poller = threading.Thread(target=self._poll, args=())
-        self._poller.start()
+            # Poll whether the tensor clipping is finished
+            self._submission_queue = {}
+            self._submission_poller = threading.Thread(target=self._submission_poll, args=())
+            self._submission_poller.start()
+
+            # Poll whether the tensor allreduce is finished.
+            self._completion_queue = queue.Queue()
+            self._completion_poller = threading.Thread(target=self._completion_poll, args=())
+            self._completion_poller.start()
 
     """Below are helper methods"""
 
@@ -54,7 +59,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         return getattr(self._opt, item)
 
     def _get_parameter_name(self, p):
-        name = self._parameter_names.get(p)
+        if self._is_tensor_instance:
+            name = self._parameter_names.get(p.__hash__())
+        else:
+            name = self._parameter_names.get(p)
         return name
 
     """Overwrite zero_grad function in horovod._DistributedOptimizer"""
@@ -80,6 +88,19 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     """Below are actual communication methods"""
 
+    def _synchronize(self):
+        """Allreduce missing parameters"""
+        missing_p = self._requires_update - set(self._handles.keys())
+        for p in missing_p:
+            handle, ctx = self._instant_allreduce_grad_async(p)
+            self._handles[p] = (handle, ctx)
+
+        for p, value in self._handles.items():
+            handle, ctx = value
+            if handle is None:
+                handle, ctx = self._instant_allreduce_grad_async(p)
+                self._handles[p] = (handle, ctx)
+
     def step(self, closure=None):
         """Override the default step function."""
         self._logger.debug("{} calls step() {}".format(self._desc, self._step))
@@ -90,13 +111,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             # if it is the final training step, wait for the completion of all tensors
             if self._step == self._final_step:
                 self._logger.debug("final step {}, waiting for allreduce completion.".format(self._final_step))
-                while not self._event_queue.empty():
+                while not self._completion_queue.empty():
                     sleep_time = os.environ.get('SCHEDULER_INTERVAL')
                     if sleep_time is None:
                         sleep_time = 0.001
                     time.sleep(sleep_time)
-                self._event_queue.put((None, None, None))
-                self._poller.join()
+                self._completion_queue.put((None, None, None))
+                self._completion_poller.join()
                 self._logger.info("training finished!")
             loss = None
             if closure is not None:
@@ -108,14 +129,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             super(self._opt.__class__, self._opt).step()
             self._step += 1
 
-    def _scheduled_allreduce_grad_async(self, p):
-        """Call Horovod API to allreduce gradient asynchronously
-        Arguments:
-            tensor: The tensor to allreduce.
-            name: The name of the tensor.
-        Returns:
-            an allreduce handle and context
-        """
+    def _instant_allreduce_grad_async(self, p):
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
@@ -136,51 +150,80 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                                   postscale_factor=postscale_factor)
         self._logger.debug("{} calls allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
-        self._event_queue.put((p, handle, ctx))
+        self._completion_queue.put((p, handle, ctx))
         return handle, ctx
 
+    def _scheduled_allreduce_grad_async(self, p):
+        """Call Horovod API to allreduce gradient asynchronously
+        Arguments:
+            tensor: The tensor to allreduce.
+            name: The name of the tensor.
+        Returns:
+            an allreduce handle and context
+        """
+        """ tensor -> tensor_compressed -> clipped_tensors -> submission_queue.put
+            poll(submission_queue) -> allreduce_async ->completion_queue.put(handle)
+            poll(completion_queue) -> tensor_allreduced -> p.grad.set(tensor_allreduced)
+        """
+        name = self._get_parameter_name(p)
+        tensor = p.grad
+        tensor_compressed, ctx = self._compression.compress(tensor)
+
+        self._locks[p].acquire()
+        tensors = self._tensor_clipping(tensor_compressed)
+        self._submission_poller[p] = tensors
+        """handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
+                                  prescale_factor=prescale_factor,
+                                  postscale_factor=postscale_factor)"""
+        self._logger.debug("{} calls allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
+        # Add to queue to poll completion
+        #self._completion_queue.put((p, handle, ctx))
+        return ctx
+
     """TODO: Change handle manipulating process to one tensor with multiple handles"""
-    def _poll(self):
-        """Poll the completion of the tensor's backward or allreduce from a FIFO event_queue"""
+    def _completion_poll(self):
+        """Poll the completion of the tensor's backward or allreduce from a FIFO completion_queue"""
         while True:
-            p, handle, ctx = self._event_queue.get()
+            p, handles, ctx = self._completion_queue.get()
             if p is None:
                 self._logger.debug("poller exits.")
                 break
             # Check whether the allreduce is finished. If so, start updating parameters.
-            if handle is not None and poll(handle):
-                output = synchronize(handle)
-                p.grad.set_(self._compression.decompress(output, ctx))
-                self._logger.debug("{} {} finished allreduce".format(self._desc, self._get_parameter_name(p)))
-                self._allreduce_delay[p] = self.backward_passes_per_step
-                # So only support SGD, Adam and RMSprop optimizers in torch
-                if isinstance(self._opt, torch.optim.SGD):
-                    self._sgd(p)
-                elif isinstance(self._opt, torch.optim.Adam):
-                    self._adam(p)
-                elif isinstance(self._opt, torch.optim.RMSprop):
-                    self._rmsprop(p)
+            """for handle in handles:
+                if handle is not None and poll(handle):
+                    output = synchronize(handle)
+
+                    p.grad.set_(self._compression.decompress(output, ctx))
+                    self._logger.debug("{} {} finished allreduce".format(self._desc, self._get_parameter_name(p)))
+                    self._allreduce_delay[p] = self.backward_passes_per_step
+                    # So only support SGD, Adam and RMSprop optimizers in torch
+                    if isinstance(self._opt, torch.optim.SGD):
+                        self._sgd(p)
+                    elif isinstance(self._opt, torch.optim.Adam):
+                        self._adam(p)
+                    elif isinstance(self._opt, torch.optim.RMSprop):
+                        self._rmsprop(p)
+                    else:
+                        raise ValueError("Invalid optimizer! Only support SGD, Adam and RMSprop.")
+                    self._zero_one_grad(p)
+                    # notify update completion and parameter is ready for forward propagation
+                    if p in self._locks:
+                        self._locks[p].release()
                 else:
-                    raise ValueError("Invalid optimizer! Only support SGD, Adam and RMSprop.")
-                self._zero_one_grad(p)
-                # notify update completion and parameter is ready for forward propagation
-                if p in self._locks:
-                    self._locks[p].release()
+                    self._completion_queue.put((p, handle, ctx))"""
+
+    def _submission_poll(self):
+        while True:
+            if self.op == Average:
+                # Split average operation across pre/postscale factors
+                # C++ backend will apply additional 1 / size() factor to postscale_factor for op == Average.
+                # Above division process will be performed in operations.cc at line 1030 
+                prescale_factor = 1.0 / self.gradient_predivide_factor
+                postscale_factor = self.gradient_predivide_factor
             else:
-                self._event_queue.put((p, handle, ctx))
-
-    def _synchronize(self):
-        """Push pull missing parameters"""
-        missing_p = self._requires_update - set(self._handles.keys())
-        for p in missing_p:
-            handle, ctx = self._push_pull_grad_async(p)
-            self._handles[p] = (handle, ctx)
-
-        for p, value in self._handles.items():
-            handle, ctx = value
-            if handle is None:
-                handle, ctx = self._push_pull_grad_async(p)
-                self._handles[p] = (handle, ctx)
+                prescale_factor = 1.0
+                postscale_factor = 1.0
+            pass
 
     """Below are tensor clipping and aggregation"""
 
@@ -188,12 +231,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         """Called when tensor arrives at _scheduled_allreduce_grad_async()
            to clip tensor into multiple tensors based on SIZE.
            Each clipped tensor has its own handle.
-           Clipped tensors will be aggregated in _poll()"""
+           Clipped tensors will be aggregated in _completion_poll()"""
+        name = self._get_parameter_name(p)
         tensor = p.grad
 
     def _tensor_aggregation(self, p):
         name = self._get_parameter_name(p)
-        handle = 
+        tensor = p.grad
 
 
     """Below are hooks used in forward propagation and backward propagation"""
