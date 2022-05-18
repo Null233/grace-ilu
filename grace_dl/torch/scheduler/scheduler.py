@@ -155,7 +155,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                                   postscale_factor=postscale_factor)
         self._logger.debug("{} calls allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
-        self._completion_queue.put((p, handle, ctx))
+        self._completion_queue.put((p, [handle], ctx))
         return handle, ctx
 
     """Call Horovod API to allreduce gradient asynchronously
@@ -169,7 +169,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         poll(submission_queue) -> allreduce_async ->completion_queue.put(handle)
         poll(completion_queue) -> tensor_allreduced -> p.grad.set(tensor_allreduced)
     """
-    """def _scheduled_allreduce_grad_async(self, p):
+    def _scheduled_allreduce_grad_async(self, p):
         
         name = self._get_parameter_name(p)
         tensor = p.grad
@@ -179,21 +179,32 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         tensors = self._tensor_clipping(tensor_compressed)
         self._submission_queue.put((p, tensors, ctx))
         self._logger.info("{} put to submission queue {}".format(self._desc, self._get_parameter_name(p)))
-        return None, ctx"""
+        return None, ctx
 
-    """Poll the completion of the tensor's backward or push-pull from a FIFO completion_queue"""
+    """TODO: Change handle manipulating process to one tensor with multiple handles"""
     def _completion_poll(self):
+        """Poll the completion of the tensor's backward or allreduce from a FIFO completion_queue"""
+        _aggregate = False
         while True:
-            p, handle, ctx = self._completion_queue.get()
+            p, handles, ctx = self._completion_queue.get()
             if p is None:
                 self._logger.debug("poller exits.")
                 break
-            # Check whether the push-pull is finished. If so, start updating parameters.
-            if handle is not None and poll(handle):
-                output = synchronize(handle)
+            # Check whether the allreduce is finished. If so, start updating parameters.
+            for handle in handles:
+                outputs = []
+                if handle is not None and poll(handle):
+                    outputs.append(synchronize(handle))
+                    _aggregate = True
+                else:
+                    self._completion_queue.put((p, handles, ctx))
+                    _aggregate = False
+                    break
+            if _aggregate:
+                output = self._tensor_aggregation(p, outputs)
                 p.grad.set_(self._compression.decompress(output, ctx))
-                self._logger.debug("{} {} finished push-pull".format(self._desc, self._get_parameter_name(p)))
-                self._push_pull_delay[p] = self.backward_passes_per_step
+                self._logger.debug("{} {} finished allreduce".format(self._desc, self._get_parameter_name(p)))
+                self._allreduce_delay[p] = self.backward_passes_per_step
                 # So only support SGD, Adam and RMSprop optimizers in torch
                 if isinstance(self._opt, torch.optim.SGD):
                     self._sgd(p)
@@ -207,10 +218,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 # notify update completion and parameter is ready for forward propagation
                 if p in self._locks:
                     self._locks[p].release()
-            else:
-                self._completion_queue.put((p, handle, ctx))
 
-    """def _submission_poll(self):
+    def _submission_poll(self):
         while True:
             if self.op == Average:
                 # Split average operation across pre/postscale factors
@@ -230,22 +239,22 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                                     prescale_factor=prescale_factor,
                                     postscale_factor=postscale_factor)
                 handles.append(handle)
-            self._completion_queue.put((p, handles, ctx))"""
+            self._completion_queue.put((p, handles, ctx))
 
     """Below are tensor clipping and aggregation"""
 
-    """Called when tensor arrives at _scheduled_allreduce_grad_async()
+    def _tensor_clipping(self, tensor):
+        """Called when tensor arrives at _scheduled_allreduce_grad_async()
            to clip tensor into multiple tensors based on SIZE.
            Each clipped tensor has its own handle.
            Clipped tensors will be aggregated in _completion_poll()"""
-    """def _tensor_clipping(self, tensor):
-        return [tensor]"""
+        return [tensor]
 
-    """def _tensor_aggregation(self, p, clipped_tensors):
+    def _tensor_aggregation(self, p, clipped_tensors):
         name = self._get_parameter_name(p)
         tensor = p.grad
         shape = p.grad.shape
-        return clipped_tensors[0]"""
+        return clipped_tensors[0]
 
     """Below are hooks used in forward propagation and backward propagation"""
 
@@ -267,6 +276,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._handles[p] = (handle, ctx)
             with self._locks[p]:
                 self._logger.debug("{} {} finished backward.".format(self._desc, self._get_parameter_name(p)))
+        return hook
 
     def _register_hooks(self):
         for param_group in self.param_groups:
@@ -278,9 +288,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     grad_acc.register_hook(self._make_hook(p))
                     self._grad_accs.append(grad_acc)
 
-    """Add hook before forward propagation of each layer to block forward computation until the allreduce and
-        parameter update is finished. The blocking is implemented using a lock."""
     def _register_forward_hooks(self):
+        """Add hook before forward propagation of each layer to block forward computation until the allreduce and
+        parameter update is finished. The blocking is implemented using a lock."""
         # Recursively find all submodules
         submodules = []
         q = queue.LifoQueue()
@@ -317,6 +327,152 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
     """Below are the implementations of optimizers, e.g., SGD, Adam, RMSprop.
     The implementation is derived from Torch's code, except that we update one parameter each time."""
 
+    def _sgd(self, p):
+        """Performs a single optimization step using SGD optimizer on a parameter.
+        Arguments:
+            p: The parameter to be updated.
+        """
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+
+            for gp in group['params']:
+                if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                if weight_decay != 0:
+                    d_p.add_(weight_decay, p.data)
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
+                        buf.mul_(momentum).add_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+                p.data.add_(-group['lr'], d_p)
+                break
+
+    def _adam(self, p):
+        """Performs a single optimization step using Adam optimizer on a parameter.
+        Arguments:
+            p: The parameter to be updated.
+        """
+        for group in self.param_groups:
+            for gp in group['params']:
+                if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+                amsgrad = group['amsgrad']
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p.data)
+
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    if amsgrad:
+                        # Maintains max of all exp. moving avg. of sq. grad. values
+                        state['max_exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                if amsgrad:
+                    max_exp_avg_sq = state['max_exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                state['step'] += 1
+
+                if group['weight_decay'] != 0:
+                    grad.add_(group['weight_decay'], p.data)
+
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                if amsgrad:
+                    # Maintains the maximum of all 2nd moment running avg. till now
+                    torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+
+                    # Use the max. for normalizing running avg. of gradient
+                    denom = max_exp_avg_sq.sqrt().add_(group['eps'])
+                else:
+                    denom = exp_avg_sq.sqrt().add_(group['eps'])
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+
+                p.data.addcdiv_(-step_size, exp_avg, denom)
+                break
+
+    def _rmsprop(self, p):
+        """Performs a single optimization step using RMSprop optimizer on a parameter.
+        Arguments:
+            p: The parameter to be updated.
+        """
+        for group in self.param_groups:
+            for gp in group['params']:
+                if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
+                    continue
+                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('RMSprop does not support sparse gradients')
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['square_avg'] = torch.zeros_like(p.data)
+                    if group['momentum'] > 0:
+                        state['momentum_buffer'] = torch.zeros_like(p.data)
+                    if group['centered']:
+                        state['grad_avg'] = torch.zeros_like(p.data)
+
+                square_avg = state['square_avg']
+                alpha = group['alpha']
+
+                state['step'] += 1
+
+                if group['weight_decay'] != 0:
+                    grad = grad.add(group['weight_decay'], p.data)
+
+                square_avg.mul_(alpha).addcmul_(1 - alpha, grad, grad)
+
+                if group['centered']:
+                    grad_avg = state['grad_avg']
+                    grad_avg.mul_(alpha).add_(1 - alpha, grad)
+                    avg = square_avg.addcmul(-1, grad_avg, grad_avg).sqrt().add_(group['eps'])
+                else:
+                    avg = square_avg.sqrt().add_(group['eps'])
+
+                if group['momentum'] > 0:
+                    buf = state['momentum_buffer']
+                    buf.mul_(group['momentum']).addcdiv_(grad, avg)
+                    p.data.add_(-group['lr'], buf)
+                else:
+                    p.data.addcdiv_(-group['lr'], grad, avg)
+                break
     
 
 def _init_logger():
