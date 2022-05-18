@@ -189,7 +189,6 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         for p, (handle, ctx) in self._handles.items():
             if isinstance(p, tuple):
-                # This was a grouped result, need to unpack
                 outputs = synchronize(handle)
                 for gp, output, gctx in zip(p, outputs, ctx):
                     self._allreduce_delay[gp] = self.backward_passes_per_step
