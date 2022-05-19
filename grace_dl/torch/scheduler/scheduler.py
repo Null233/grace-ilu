@@ -98,12 +98,14 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         missing_p = self._requires_update - set(self._handles.keys())
         for p in missing_p:
             handle, ctx = self._instant_allreduce_grad_async(p)
+            self._logger.debug("missing_p occures!")
             self._handles[p] = (handle, ctx)
 
         for p, value in self._handles.items():
             handle, ctx = value
             if handle is None:
                 handle, ctx = self._instant_allreduce_grad_async(p)
+                self._logger.debug("None handle occures!")
                 self._handles[p] = (handle, ctx)
 
     def step(self, closure=None):
@@ -239,7 +241,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                                     postscale_factor=postscale_factor)
                 handles.append(handle)
             self._completion_queue.put((p, handles, ctx))
-
+            p_handles, p_ctx = self._handles[p]
+            p_handles = [] if p_handles is None else p_handles + handles
+            self._handles[p] = (p_handles, p_ctx)
+            
     """Below are tensor clipping and aggregation"""
 
     def _tensor_clipping(self, tensor):
@@ -485,7 +490,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 def _init_bsc():
     """Replace _register_hook() function in _DistributedOptimizer with empty function."""
