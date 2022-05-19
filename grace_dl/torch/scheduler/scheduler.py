@@ -49,9 +49,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._register_hooks()
 
             # Poll whether the tensor clipping is finished
-            """self._submission_queue = queue.LifoQueue()
+            self._submission_queue = queue.LifoQueue()
             self._submission_poller = threading.Thread(target=self._submission_poll, args=())
-            self._submission_poller.start()"""
+            self._submission_poller.start()
 
             # Poll whether the tensor allreduce is finished.
             self._completion_queue = queue.Queue()
@@ -153,24 +153,23 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=prescale_factor,
                                   postscale_factor=postscale_factor)
-        self._logger.debug("{} calls allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
+        self._logger.debug("{} calls instant allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
         self._completion_queue.put((p, [handle], ctx))
         return handle, ctx
 
-    """Call Horovod API to allreduce gradient asynchronously
-        Arguments:
-            tensor: The tensor to allreduce.
-            name: The name of the tensor.
-        Returns:
-            an allreduce handle and context
-
-        tensor -> tensor_compressed -> clipped_tensors -> submission_queue.put
-        poll(submission_queue) -> allreduce_async ->completion_queue.put(handle)
-        poll(completion_queue) -> tensor_allreduced -> p.grad.set(tensor_allreduced)
-    """
     def _scheduled_allreduce_grad_async(self, p):
-        
+        """Call Horovod API to allreduce gradient asynchronously
+            Arguments:
+                tensor: The tensor to allreduce.
+                name: The name of the tensor.
+            Returns:
+                an allreduce handle and context
+
+            tensor -> tensor_compressed -> clipped_tensors -> submission_queue.put
+            poll(submission_queue) -> allreduce_async ->completion_queue.put(handle)
+            poll(completion_queue) -> tensor_allreduced -> p.grad.set(tensor_allreduced)
+        """
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
@@ -178,7 +177,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._locks[p].acquire()
         tensors = self._tensor_clipping(tensor_compressed)
         self._submission_queue.put((p, tensors, ctx))
-        self._logger.info("{} put to submission queue {}".format(self._desc, self._get_parameter_name(p)))
+        self._logger.debug("{} put to submission queue {}".format(self._desc, self._get_parameter_name(p)))
         return None, ctx
 
     """TODO: Change handle manipulating process to one tensor with multiple handles"""
@@ -231,7 +230,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 prescale_factor = 1.0
                 postscale_factor = 1.0
             p, tensors, ctx = self._submission_queue.get()
-            self._logger.info("{} submission poll got {}".format(self._desc, self._get_parameter_name(p)))
+            self._logger.debug("{} submission poll got {}".format(self._desc, self._get_parameter_name(p)))
             name = self._get_parameter_name(p)
             handles = []
             for tensor in tensors:
@@ -272,7 +271,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             handle, ctx = None, None
             self._allreduce_delay[p] -= 1
             if self._allreduce_delay[p] == 0:
-                handle, ctx = self._instant_allreduce_grad_async(p)
+                handle, ctx = self._scheduled_allreduce_grad_async(p)
             self._handles[p] = (handle, ctx)
             with self._locks[p]:
                 self._logger.debug("{} {} finished backward.".format(self._desc, self._get_parameter_name(p)))
@@ -486,7 +485,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 def _init_bsc():
     """Replace _register_hook() function in _DistributedOptimizer with empty function."""
