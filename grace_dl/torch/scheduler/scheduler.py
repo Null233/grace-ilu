@@ -27,6 +27,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
         self._model = model
         self._opt = hvd_opt
+        self._scheduler = True
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.info("Scheduler is enabled.")
@@ -37,6 +38,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._final_step = num_steps
         self._clipping_size = 4096
         self._sending_window = 2
+
+        if self.op == Average:
+            self.prescale_factor = 1.0 / self.gradient_predivide_factor
+            self.postscale_factor = self.gradient_predivide_factor
+        else:
+            self.prescale_factor = 1.0 
+            self.postscale_factor = 1.0
 
         self._locks = {}
         for param_group in self.param_groups:
@@ -49,9 +57,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._register_hooks()
 
             # Poll whether the tensor clipping is finished
-            self._submission_queue = queue.LifoQueue()
-            self._submission_poller = threading.Thread(target=self._submission_poll, args=())
-            self._submission_poller.start()
+            if self._scheduler:
+                self._submission_queue = queue.LifoQueue()
+                self._submission_poller = threading.Thread(target=self._submission_poll, args=())
+                self._submission_poller.start()
 
             # Poll whether the tensor allreduce is finished.
             self._completion_queue = queue.Queue()
@@ -98,15 +107,14 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         missing_p = self._requires_update - set(self._handles.keys())
         for p in missing_p:
             handle, ctx = self._instant_allreduce_grad_async(p)
-            self._logger.debug("missing_p occures!")
-            self._handles[p] = (handle, ctx)
+            self._handles[p] = (handle, ctx, True)
 
         for p, value in self._handles.items():
-            handle, ctx = value
-            if handle is None:
+            handle, ctx, enqueued = value
+            if handle is None and not enqueued:
                 handle, ctx = self._instant_allreduce_grad_async(p)
-                self._logger.debug("None handle occures!")
-                self._handles[p] = (handle, ctx)
+                self._logger.debug("None handle occures at {}!".format(self._get_parameter_name(p)))
+                self._handles[p] = (handle, ctx, True)
 
     def step(self, closure=None):
         """Override the default step function."""
@@ -140,21 +148,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
-
-        if self.op == Average:
-            # Split average operation across pre/postscale factors
-            # C++ backend will apply additional 1 / size() factor to postscale_factor for op == Average.
-            # Above division process will be performed in operations.cc at line 1030 
-            prescale_factor = 1.0 / self.gradient_predivide_factor
-            postscale_factor = self.gradient_predivide_factor
-        else:
-            prescale_factor = 1.0
-            postscale_factor = 1.0
-
-        self._locks[p].acquire()
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
-                                  prescale_factor=prescale_factor,
-                                  postscale_factor=postscale_factor)
+                                  prescale_factor=self.prescale_factor,
+                                  postscale_factor=self.postscale_factor)
         self._logger.debug("{} calls instant allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
         self._completion_queue.put((p, [handle], ctx))
@@ -176,22 +172,21 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
 
-        self._locks[p].acquire()
         tensors = self._tensor_clipping(tensor_compressed)
         self._submission_queue.put((p, tensors, ctx))
-        self._logger.debug("{} put to submission queue {}".format(self._desc, self._get_parameter_name(p)))
+        self._logger.debug("{} put to submission queue {}".format(self._desc, name))
         return None, ctx
 
     """TODO: Change handle manipulating process to one tensor with multiple handles"""
     def _completion_poll(self):
         """Poll the completion of the tensor's backward or allreduce from a FIFO completion_queue"""
-        _aggregate = False
         while True:
             p, handles, ctx = self._completion_queue.get()
             if p is None:
                 self._logger.debug("poller exits.")
                 break
             # Check whether the allreduce is finished. If so, start updating parameters.
+            _aggregate = False
             for handle in handles:
                 outputs = []
                 if handle is not None and poll(handle):
@@ -222,29 +217,23 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     def _submission_poll(self):
         while True:
-            if self.op == Average:
-                # Split average operation across pre/postscale factors
-                # C++ backend will apply additional 1 / size() factor to postscale_factor for op == Average.
-                # Above division process will be performed in operations.cc at line 1030 
-                prescale_factor = 1.0 / self.gradient_predivide_factor
-                postscale_factor = self.gradient_predivide_factor
-            else:
-                prescale_factor = 1.0
-                postscale_factor = 1.0
             p, tensors, ctx = self._submission_queue.get()
             self._logger.debug("{} submission poll got {}".format(self._desc, self._get_parameter_name(p)))
             name = self._get_parameter_name(p)
             handles = []
             for tensor in tensors:
                 handle = allreduce_async_(tensor, name=name, op=self.op,
-                                    prescale_factor=prescale_factor,
-                                    postscale_factor=postscale_factor)
+                                    prescale_factor=self.prescale_factor,
+                                    postscale_factor=self.postscale_factor)
                 handles.append(handle)
             self._completion_queue.put((p, handles, ctx))
-            p_handles, p_ctx = self._handles[p]
-            p_handles = [] if p_handles is None else p_handles + handles
-            self._handles[p] = (p_handles, p_ctx)
-            
+            if self._handles.get(p) is not None:
+                (p_handles, p_ctx, enqueued) = self._handles[p]
+                p_handles = [] if p_handles is None else p_handles + handles
+                self._handles[p] = (p_handles, p_ctx, enqueued)
+            else:
+                self._handles[p] = (handles, ctx, True)
+
     """Below are tensor clipping and aggregation"""
 
     def _tensor_clipping(self, tensor):
@@ -276,10 +265,12 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             handle, ctx = None, None
             self._allreduce_delay[p] -= 1
             if self._allreduce_delay[p] == 0:
-                handle, ctx = self._scheduled_allreduce_grad_async(p)
-            self._handles[p] = (handle, ctx)
-            with self._locks[p]:
-                self._logger.debug("{} {} finished backward.".format(self._desc, self._get_parameter_name(p)))
+                self._locks[p].acquire()
+                if self._scheduler:
+                    handle, ctx = self._scheduled_allreduce_grad_async(p)
+                else:
+                    handle, ctx = self._instant_allreduce_grad_async(p)
+            self._handles[p] = (handle, ctx, True)
         return hook
 
     def _register_hooks(self):
@@ -490,7 +481,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 def _init_bsc():
     """Replace _register_hook() function in _DistributedOptimizer with empty function."""
