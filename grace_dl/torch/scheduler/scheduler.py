@@ -57,7 +57,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._final_step = num_steps
 
         self._clipping_size = 4096
-        self._window_size = 5
+        self._window_size = 20
         self._time_model = {}
 
         if self.op == Average:
@@ -77,19 +77,19 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._register_hooks()
             self._clipping_chunks = {}  # KEY: parameter; VALUE: number of clipped chunks
 
-            # Poll whether the tensor allreduce is finished.
+            self._submission_queue = queue.LifoQueue()
             self._completion_cache = {}  # KEY: parameter; VALUE: [outputs]
+            
             self._completion_lock = threading.Lock()
             self._completion_queue = queue.Queue(maxsize=self._window_size)
+        
             self._completion_poller = threading.Thread(target=self._completion_poll,
                                                        name="COMPLETION_POLLER", args=())
+            self._submission_poller = threading.Thread(target=self._submission_poll,
+                                                       name="SUBMISSION_POLLER", args=())
             self._completion_poller.start()
-
             # Poll whether the tensor clipping is finished
             if self._scheduler:
-                self._submission_queue = queue.LifoQueue()
-                self._submission_poller = threading.Thread(target=self._submission_poll,
-                                                           name="SUBMISSION_POLLER", args=())
                 self._submission_poller.start()
 
     """Below are warm-up procedures using fake data"""
@@ -228,7 +228,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
-        self._locks[p].acquire()
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
@@ -253,7 +252,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
-        self._locks[p].acquire()
         tensors = self._tensor_clipping(p, tensor_compressed)
         tensor_offset = 0
         for tensor in tensors:
@@ -262,8 +260,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._logger.debug(
             "{} put to submission queue {}".format(self._desc, name))
         return None, ctx
-
-    """TODO: Change handle manipulating process to one tensor with multiple handles"""
 
     def _completion_poll(self):
         """Poll the completion of the tensor's backward or allreduce from a FIFO completion_queue"""
@@ -275,18 +271,20 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         self._logger.debug("poller exits.")
                         break
                     if not (handle is not None and poll(handle)):
-                        self._completion_queue.put((p, handle, ctx))
+                        self._completion_queue.put_nowait((p, handle, ctx))
                         continue
             except:
                 continue
-            # Allreduce is finished. Start updating parameters.
+            print(f"before sync, handle is:{handle}")
             output = synchronize(handle)
+            print(f"after sync, handle is:{handle}")
             if not self._completion_cache.get(p):
                 self._completion_cache[p] = [output]
             else:
                 self._completion_cache[p].append(output)
             if len(self._completion_cache[p]) == self._clipping_chunks[p]:
                 output = self._tensor_aggregation(p, self._completion_cache[p])
+                
                 p.grad.set_(self._compression.decompress(output, ctx))
                 self._logger.debug("{} {} finished allreduce".format(
                     self._desc, self._get_parameter_name(p)))
@@ -296,15 +294,24 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 # notify update completion and parameter is ready for forward propagation
                 if p in self._locks:
                     self._locks[p].release()
+            
+            # Allreduce is finished. Start updating parameters.
+            
 
     def _submission_poll(self):
         while True:
             with self._completion_lock:
+                #print("S_P")
                 if not self._completion_queue.full():
-                    p, tensor, ctx, offset = self._submission_queue.get()
-                    self._logger.debug("{} submission poll got {}".format(
-                        self._desc, self._get_parameter_name(p)))
+                    try:
+                        p, tensor, ctx, offset = self._submission_queue.get_nowait()
+                    except:
+                        continue
+                    self._logger.debug("{} submission poll got {} chunk {}".format(
+                        self._desc, self._get_parameter_name(p), offset))
                     name = self._get_parameter_name(p) + '_' + str(offset)
+                    self._logger.debug(
+                                "{} put to completion queue {}".format(self._desc, name))
                     handle = allreduce_async_(tensor, name=name, op=self.op,
                                               prescale_factor=self.prescale_factor,
                                               postscale_factor=self.postscale_factor)
@@ -315,6 +322,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         self._handles[p] = (p_handles, p_ctx, enqueued)
                     else:
                         self._handles[p] = ([handle], ctx, True)
+            #time.sleep(0.005)
 
     """Below are tensor clipping and aggregation"""
 
@@ -361,14 +369,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             assert self._allreduce_delay[p] > 0
             handle, ctx = None, None
             self._allreduce_delay[p] -= 1
+            self._locks[p].acquire()
             if self._allreduce_delay[p] == 0:
                 if self._scheduler:
                     handle, ctx = self._scheduled_allreduce_grad_async(p)
                 else:
                     handle, ctx = self._instant_allreduce_grad_async(p)
             self._handles[p] = (handle, ctx, True)
-            self._logger.debug("{} finished backward {}.".format(
-                self._desc, self._get_parameter_name(p)))
         return hook
 
     def _register_hooks(self):
@@ -403,15 +410,16 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     del self._handles[p]
                 if p not in self._locks:
                     continue
+                #print(f"require: {self._get_parameter_name(p)}")
                 with self._locks[p]:
                     self._logger.debug("{} {} is ready.".format(
                         self._desc, self._get_parameter_name(p)))
-
-            self._logger.debug("{} starts forward {}.".format(self._desc, mod))
+            #self._logger.debug("{} starts forward {}.".format(self._desc, mod))
 
         def after_forward_hook(mod, input, result):
-            self._logger.debug(
-                "{} finished forward {}.".format(self._desc, mod))
+            pass
+            # self._logger.debug(
+            #     "{} finished forward {}.".format(self._desc, mod))
 
         # Register pre-hook and hook for each module
         for mod in reversed(submodules):
@@ -437,8 +445,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for gp in group['params']:
                 if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
                     continue
-                self._logger.debug("{} is updating {}".format(
-                    self._desc, self._get_parameter_name(p)))
                 if p.grad is None:
                     continue
                 d_p = p.grad.data
@@ -469,8 +475,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for gp in group['params']:
                 if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
                     continue
-                self._logger.debug("{} is updating {}".format(
-                    self._desc, self._get_parameter_name(p)))
                 if p.grad is None:
                     continue
                 grad = p.grad.data
@@ -533,8 +537,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for gp in group['params']:
                 if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
                     continue
-                self._logger.debug("{} is updating {}".format(
-                    self._desc, self._get_parameter_name(p)))
                 if p.grad is None:
                     continue
                 grad = p.grad.data
@@ -590,7 +592,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 
 def _init_bsc():
