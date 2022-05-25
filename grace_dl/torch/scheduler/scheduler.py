@@ -79,10 +79,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
             self._submission_queue = queue.LifoQueue()
             self._completion_cache = {}  # KEY: parameter; VALUE: [outputs]
-            
+
             self._completion_lock = threading.Lock()
             self._completion_queue = queue.Queue(maxsize=self._window_size)
-        
+
             self._completion_poller = threading.Thread(target=self._completion_poll,
                                                        name="COMPLETION_POLLER", args=())
             self._submission_poller = threading.Thread(target=self._submission_poll,
@@ -220,7 +220,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._step += 1
             return loss
         else:
-            # Optimizer.step() will be triggered when user calls byteps.broadcast_optimizer_sate()
+            # Optimizer.step() will be triggered when user calls hvd.broadcast_optimizer_sate()
             super(self._opt.__class__, self._opt).step()
             self._step += 1
 
@@ -234,7 +234,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._logger.debug("{} calls instant allreduce_async_ for {}".format(
             self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
-        self._completion_queue.put((p, [handle], ctx))
+        self._completion_queue.put((p, handle, ctx))
         return handle, ctx
 
     def _scheduled_allreduce_grad_async(self, p):
@@ -275,16 +275,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         continue
             except:
                 continue
-            print(f"before sync, handle is:{handle}")
             output = synchronize(handle)
-            print(f"after sync, handle is:{handle}")
             if not self._completion_cache.get(p):
                 self._completion_cache[p] = [output]
             else:
                 self._completion_cache[p].append(output)
             if len(self._completion_cache[p]) == self._clipping_chunks[p]:
                 output = self._tensor_aggregation(p, self._completion_cache[p])
-                
                 p.grad.set_(self._compression.decompress(output, ctx))
                 self._logger.debug("{} {} finished allreduce".format(
                     self._desc, self._get_parameter_name(p)))
@@ -294,14 +291,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 # notify update completion and parameter is ready for forward propagation
                 if p in self._locks:
                     self._locks[p].release()
-            
-            # Allreduce is finished. Start updating parameters.
-            
 
     def _submission_poll(self):
         while True:
             with self._completion_lock:
-                #print("S_P")
                 if not self._completion_queue.full():
                     try:
                         p, tensor, ctx, offset = self._submission_queue.get_nowait()
@@ -311,7 +304,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         self._desc, self._get_parameter_name(p), offset))
                     name = self._get_parameter_name(p) + '_' + str(offset)
                     self._logger.debug(
-                                "{} put to completion queue {}".format(self._desc, name))
+                        "{} put to completion queue {}".format(self._desc, name))
                     handle = allreduce_async_(tensor, name=name, op=self.op,
                                               prescale_factor=self.prescale_factor,
                                               postscale_factor=self.postscale_factor)
@@ -322,7 +315,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         self._handles[p] = (p_handles, p_ctx, enqueued)
                     else:
                         self._handles[p] = ([handle], ctx, True)
-            #time.sleep(0.005)
+            # time.sleep(0.005)
 
     """Below are tensor clipping and aggregation"""
 
