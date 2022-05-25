@@ -10,6 +10,7 @@ import time
 import os
 import math
 import torch
+import timeit
 
 from horovod.torch.compression import Compression
 from horovod.torch.mpi_ops import size, rank
@@ -18,16 +19,34 @@ from horovod.torch.mpi_ops import allreduce_async_
 from horovod.torch.mpi_ops import synchronize, poll
 from horovod.torch.mpi_ops import size
 
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+
 from grace_dl.torch.optimizer_basic import _DistributedOptimizer, DistributedOptimizer
 
 _hvd_DistributedOptimizer = DistributedOptimizer
 
+
 class _Scheduled_Optimizer(_DistributedOptimizer):
-    def __init__(self, model, hvd_opt, num_steps=10**6):
+    def __init__(self, model, hvd_opt, num_steps=10**6, **kwargs):
 
         self._model = model
         self._opt = hvd_opt
         self._scheduler = True
+        self._update_time_model = True
+
+        # kwargs = {'warm_up':True, 'batch_size':32,
+        #           'num_batch':10, 'batches_per_iter':10,
+        #           'num_iters':10, 'profiler': True}
+        # optimizer = Scheduled_Optimizer(model, optimizer,
+        #                        named_parameters=model.named_parameters(),
+        #                        num_steps= len(train_loader)/args.batch_size * args.epochs,
+        #                        kwargs=kwargs)
+        self._warm_up = False if kwargs.get(
+            'warm_up') is None else kwargs.get('warm_up')
+        if(self._warm_up):
+            self._warm_up_params = kwargs
+            self._do_warm_up()
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.info("Scheduler is enabled.")
@@ -36,36 +55,81 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
         self._step = 0
         self._final_step = num_steps
+
         self._clipping_size = 4096
-        self._sending_window = 2
+        self._window_size = 5
+        self._time_model = {}
 
         if self.op == Average:
             self.prescale_factor = 1.0 / self.gradient_predivide_factor
             self.postscale_factor = self.gradient_predivide_factor
         else:
-            self.prescale_factor = 1.0 
+            self.prescale_factor = 1.0
             self.postscale_factor = 1.0
 
         self._locks = {}
         for param_group in self.param_groups:
             for p in param_group['params']:
                 self._locks[p] = threading.Lock()
-        self._submission_lock = threading.Lock()
 
         if size() > 1:
             self._register_forward_hooks()
             self._register_hooks()
+            self._clipping_chunks = {}  # KEY: parameter; VALUE: number of clipped chunks
+
+            # Poll whether the tensor allreduce is finished.
+            self._completion_cache = {}  # KEY: parameter; VALUE: [outputs]
+            self._completion_lock = threading.Lock()
+            self._completion_queue = queue.Queue(maxsize=self._window_size)
+            self._completion_poller = threading.Thread(target=self._completion_poll,
+                                                       name="COMPLETION_POLLER", args=())
+            self._completion_poller.start()
 
             # Poll whether the tensor clipping is finished
             if self._scheduler:
                 self._submission_queue = queue.LifoQueue()
-                self._submission_poller = threading.Thread(target=self._submission_poll, args=())
+                self._submission_poller = threading.Thread(target=self._submission_poll,
+                                                           name="SUBMISSION_POLLER", args=())
                 self._submission_poller.start()
 
-            # Poll whether the tensor allreduce is finished.
-            self._completion_queue = queue.Queue()
-            self._completion_poller = threading.Thread(target=self._completion_poll, args=())
-            self._completion_poller.start()
+    """Below are warm-up procedures using fake data"""
+
+    def _do_warm_up(self):
+        log('Running warmup...')
+        model = self._model
+        cudnn.benchmark = True
+        self._opt.broadcast_parameters(model.state_dict(), root_rank=0)
+        self._opt.broadcast_optimizer_state(self, root_rank=0)
+
+        for _ in range(100):
+            data = torch.rand(self._warm_up_params.get(
+                'batch_size'), 3, 224, 224)
+            target = torch.LongTensor(
+                self._warm_up_params.get('batch_size')).random_() % 1000
+            data, target = data.cuda(), target.cuda()
+
+        def benchmark_step():
+            self.zero_grad()
+            output = model(data)
+            loss = F.cross_entropy(output, target)
+            loss.backward()
+            self.step()
+
+        def log(s, nl=True):
+            if rank() != 0:
+                return
+            print(s, end='\n' if nl else '')
+
+        img_secs = []
+        enable_profiling = self._warm_up_params.get('profiler') & (rank() == 0)
+        with torch.autograd.profiler.profile(enable_profiling, True) as prof:
+            for x in range(self._warm_up_params.get('num_iters')):
+                time = timeit.timeit(
+                    benchmark_step, number=self._warm_up_params.get('num_batches_per_iter'))
+                img_sec = self._warm_up_params.get('batch_size') * \
+                    self._warm_up_params.get('num_batches_per_iter') / time
+                log('Iter #%d: %.1f img/sec per %s' % (x, img_sec, 'GPU'))
+                img_secs.append(img_sec)
 
     """Below are helper methods"""
 
@@ -79,13 +143,27 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             name = self._parameter_names.get(p)
         return name
 
+    def _update_gradient(self, p):
+        # So only support SGD, Adam and RMSprop optimizers in torch
+        if isinstance(self._opt, torch.optim.SGD):
+            self._sgd(p)
+        elif isinstance(self._opt, torch.optim.Adam):
+            self._adam(p)
+        elif isinstance(self._opt, torch.optim.RMSprop):
+            self._rmsprop(p)
+        else:
+            raise ValueError(
+                "Invalid optimizer! Only support SGD, Adam and RMSprop.")
+        self._zero_one_grad(p)
+
     """Overwrite zero_grad function in horovod._DistributedOptimizer"""
 
     def zero_grad(self):
         """Override the default zero_grad function.
         Clears the gradients of all optimized tensors.
         """
-        self._logger.debug("{} calls zero_grad() of step {}".format(self._desc, self._step))
+        self._logger.debug(
+            "{} calls zero_grad() of step {}".format(self._desc, self._step))
         if size() > 1 and self._step > 0:
             return
         else:
@@ -113,7 +191,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             handle, ctx, enqueued = value
             if handle is None and not enqueued:
                 handle, ctx = self._instant_allreduce_grad_async(p)
-                self._logger.debug("None handle occures at {}!".format(self._get_parameter_name(p)))
+                self._logger.debug("None handle occures at {}!".format(
+                    self._get_parameter_name(p)))
                 self._handles[p] = (handle, ctx, True)
 
     def step(self, closure=None):
@@ -125,7 +204,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._synchronize()
             # if it is the final training step, wait for the completion of all tensors
             if self._step == self._final_step:
-                self._logger.debug("final step {}, waiting for allreduce completion.".format(self._final_step))
+                self._logger.debug(
+                    "final step {}, waiting for allreduce completion.".format(self._final_step))
                 while not self._completion_queue.empty():
                     sleep_time = os.environ.get('SCHEDULER_INTERVAL')
                     if sleep_time is None:
@@ -148,10 +228,12 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
+        self._locks[p].acquire()
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
-        self._logger.debug("{} calls instant allreduce_async_ for {}".format(self._desc, self._get_parameter_name(p)))
+        self._logger.debug("{} calls instant allreduce_async_ for {}".format(
+            self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
         self._completion_queue.put((p, [handle], ctx))
         return handle, ctx
@@ -171,83 +253,98 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
-
-        tensors = self._tensor_clipping(tensor_compressed)
-        self._submission_queue.put((p, tensors, ctx))
-        self._logger.debug("{} put to submission queue {}".format(self._desc, name))
+        self._locks[p].acquire()
+        tensors = self._tensor_clipping(p, tensor_compressed)
+        tensor_offset = 0
+        for tensor in tensors:
+            self._submission_queue.put((p, tensor, ctx, tensor_offset))
+            tensor_offset += 1
+        self._logger.debug(
+            "{} put to submission queue {}".format(self._desc, name))
         return None, ctx
 
     """TODO: Change handle manipulating process to one tensor with multiple handles"""
+
     def _completion_poll(self):
         """Poll the completion of the tensor's backward or allreduce from a FIFO completion_queue"""
         while True:
-            p, handles, ctx = self._completion_queue.get()
-            if p is None:
-                self._logger.debug("poller exits.")
-                break
-            # Check whether the allreduce is finished. If so, start updating parameters.
-            _aggregate = False
-            for handle in handles:
-                outputs = []
-                if handle is not None and poll(handle):
-                    outputs.append(synchronize(handle))
-                    _aggregate = True
-                else:
-                    self._completion_queue.put((p, handles, ctx))
-                    _aggregate = False
-                    break
-            if _aggregate:
-                output = self._tensor_aggregation(p, outputs)
+            try:
+                with self._completion_lock:
+                    p, handle, ctx = self._completion_queue.get_nowait()
+                    if p is None:
+                        self._logger.debug("poller exits.")
+                        break
+                    if not (handle is not None and poll(handle)):
+                        self._completion_queue.put((p, handle, ctx))
+                        continue
+            except:
+                continue
+            # Allreduce is finished. Start updating parameters.
+            output = synchronize(handle)
+            if not self._completion_cache.get(p):
+                self._completion_cache[p] = [output]
+            else:
+                self._completion_cache[p].append(output)
+            if len(self._completion_cache[p]) == self._clipping_chunks[p]:
+                output = self._tensor_aggregation(p, self._completion_cache[p])
                 p.grad.set_(self._compression.decompress(output, ctx))
-                self._logger.debug("{} {} finished allreduce".format(self._desc, self._get_parameter_name(p)))
+                self._logger.debug("{} {} finished allreduce".format(
+                    self._desc, self._get_parameter_name(p)))
                 self._allreduce_delay[p] = self.backward_passes_per_step
-                # So only support SGD, Adam and RMSprop optimizers in torch
-                if isinstance(self._opt, torch.optim.SGD):
-                    self._sgd(p)
-                elif isinstance(self._opt, torch.optim.Adam):
-                    self._adam(p)
-                elif isinstance(self._opt, torch.optim.RMSprop):
-                    self._rmsprop(p)
-                else:
-                    raise ValueError("Invalid optimizer! Only support SGD, Adam and RMSprop.")
-                self._zero_one_grad(p)
+                self._update_gradient(p)
+                self._completion_cache[p] = []
                 # notify update completion and parameter is ready for forward propagation
                 if p in self._locks:
                     self._locks[p].release()
 
     def _submission_poll(self):
         while True:
-            p, tensors, ctx = self._submission_queue.get()
-            self._logger.debug("{} submission poll got {}".format(self._desc, self._get_parameter_name(p)))
-            name = self._get_parameter_name(p)
-            handles = []
-            for tensor in tensors:
-                handle = allreduce_async_(tensor, name=name, op=self.op,
-                                    prescale_factor=self.prescale_factor,
-                                    postscale_factor=self.postscale_factor)
-                handles.append(handle)
-            self._completion_queue.put((p, handles, ctx))
-            if self._handles.get(p) is not None:
-                (p_handles, p_ctx, enqueued) = self._handles[p]
-                p_handles = [] if p_handles is None else p_handles + handles
-                self._handles[p] = (p_handles, p_ctx, enqueued)
-            else:
-                self._handles[p] = (handles, ctx, True)
+            with self._completion_lock:
+                if not self._completion_queue.full():
+                    p, tensor, ctx, offset = self._submission_queue.get()
+                    self._logger.debug("{} submission poll got {}".format(
+                        self._desc, self._get_parameter_name(p)))
+                    name = self._get_parameter_name(p) + '_' + str(offset)
+                    handle = allreduce_async_(tensor, name=name, op=self.op,
+                                              prescale_factor=self.prescale_factor,
+                                              postscale_factor=self.postscale_factor)
+                    self._completion_queue.put_nowait((p, handle, ctx))
+                    if self._handles.get(p) is not None:
+                        (p_handles, p_ctx, enqueued) = self._handles[p]
+                        p_handles = [] if p_handles is None else p_handles + [handle]
+                        self._handles[p] = (p_handles, p_ctx, enqueued)
+                    else:
+                        self._handles[p] = ([handle], ctx, True)
 
     """Below are tensor clipping and aggregation"""
 
-    def _tensor_clipping(self, tensor):
+    def _tensor_clipping(self, p, tensor):
         """Called when tensor arrives at _scheduled_allreduce_grad_async()
            to clip tensor into multiple tensors based on SIZE.
            Each clipped tensor has its own handle.
            Clipped tensors will be aggregated in _completion_poll()"""
-        return [tensor]
+        tensor = tensor.flatten()
+        offset_i = 0
+        tensors = []
+        num_chunks = 0
+        while offset_i < tensor.numel():
+            next_offset_i = offset_i + self._clipping_size
+            begin = offset_i
+            end = tensor.numel() if next_offset_i > tensor.numel() else next_offset_i
+            tensors.append(tensor.data[begin:end])
+            offset_i = next_offset_i
+            num_chunks += 1
+        self._clipping_chunks[p] = num_chunks
+        return tensors
+
+    """TODO: Consider alter out-of-place reshape to in-place"""
 
     def _tensor_aggregation(self, p, clipped_tensors):
-        name = self._get_parameter_name(p)
-        tensor = p.grad
+        # Using LIFO Queue as submission queue will insert clipped tensors in reverse
+        clipped_tensors.reverse()
         shape = p.grad.shape
-        return clipped_tensors[0]
+        agg_tensor = torch.cat(clipped_tensors, 0)
+        return agg_tensor.view(shape)
 
     """Below are hooks used in forward propagation and backward propagation"""
 
@@ -265,12 +362,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             handle, ctx = None, None
             self._allreduce_delay[p] -= 1
             if self._allreduce_delay[p] == 0:
-                self._locks[p].acquire()
                 if self._scheduler:
                     handle, ctx = self._scheduled_allreduce_grad_async(p)
                 else:
                     handle, ctx = self._instant_allreduce_grad_async(p)
             self._handles[p] = (handle, ctx, True)
+            self._logger.debug("{} finished backward {}.".format(
+                self._desc, self._get_parameter_name(p)))
         return hook
 
     def _register_hooks(self):
@@ -306,16 +404,19 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 if p not in self._locks:
                     continue
                 with self._locks[p]:
-                    self._logger.debug("{} {} is ready.".format(self._desc, self._get_parameter_name(p)))
+                    self._logger.debug("{} {} is ready.".format(
+                        self._desc, self._get_parameter_name(p)))
 
             self._logger.debug("{} starts forward {}.".format(self._desc, mod))
 
         def after_forward_hook(mod, input, result):
-            self._logger.debug("{} finished forward {}.".format(self._desc, mod))
+            self._logger.debug(
+                "{} finished forward {}.".format(self._desc, mod))
 
         # Register pre-hook and hook for each module
         for mod in reversed(submodules):
-            self._logger.debug("{} registers forward hook on module {}".format(self._desc, mod))
+            self._logger.debug(
+                "{} registers forward hook on module {}".format(self._desc, mod))
             mod.register_forward_pre_hook(pre_forward_hook)
             mod.register_forward_hook(after_forward_hook)
 
@@ -336,7 +437,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for gp in group['params']:
                 if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
                     continue
-                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                self._logger.debug("{} is updating {}".format(
+                    self._desc, self._get_parameter_name(p)))
                 if p.grad is None:
                     continue
                 d_p = p.grad.data
@@ -345,7 +447,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 if momentum != 0:
                     param_state = self.state[p]
                     if 'momentum_buffer' not in param_state:
-                        buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
+                        buf = param_state['momentum_buffer'] = torch.zeros_like(
+                            p.data)
                         buf.mul_(momentum).add_(d_p)
                     else:
                         buf = param_state['momentum_buffer']
@@ -366,12 +469,14 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for gp in group['params']:
                 if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
                     continue
-                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                self._logger.debug("{} is updating {}".format(
+                    self._desc, self._get_parameter_name(p)))
                 if p.grad is None:
                     continue
                 grad = p.grad.data
                 if grad.is_sparse:
-                    raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+                    raise RuntimeError(
+                        'Adam does not support sparse gradients, please consider SparseAdam instead')
                 amsgrad = group['amsgrad']
 
                 state = self.state[p]
@@ -413,7 +518,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
                 bias_correction1 = 1 - beta1 ** state['step']
                 bias_correction2 = 1 - beta2 ** state['step']
-                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+                step_size = group['lr'] * \
+                    math.sqrt(bias_correction2) / bias_correction1
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
                 break
@@ -427,12 +533,14 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for gp in group['params']:
                 if self._get_parameter_name(p) != self._get_parameter_name(gp) or gp.shape != p.shape:
                     continue
-                self._logger.debug("{} is updating {}".format(self._desc, self._get_parameter_name(p)))
+                self._logger.debug("{} is updating {}".format(
+                    self._desc, self._get_parameter_name(p)))
                 if p.grad is None:
                     continue
                 grad = p.grad.data
                 if grad.is_sparse:
-                    raise RuntimeError('RMSprop does not support sparse gradients')
+                    raise RuntimeError(
+                        'RMSprop does not support sparse gradients')
                 state = self.state[p]
 
                 # State initialization
@@ -457,7 +565,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 if group['centered']:
                     grad_avg = state['grad_avg']
                     grad_avg.mul_(alpha).add_(1 - alpha, grad)
-                    avg = square_avg.addcmul(-1, grad_avg, grad_avg).sqrt().add_(group['eps'])
+                    avg = square_avg.addcmul(-1, grad_avg,
+                                             grad_avg).sqrt().add_(group['eps'])
                 else:
                     avg = square_avg.sqrt().add_(group['eps'])
 
@@ -468,7 +577,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 else:
                     p.data.addcdiv_(-group['lr'], grad, avg)
                 break
-    
+
 
 def _init_logger():
     logger = logging.getLogger("Scheduler")
@@ -482,6 +591,7 @@ def _init_logger():
     logger.addHandler(fh)
     logger.propagate = False
     logger.setLevel(logging.DEBUG)
+
 
 def _init_bsc():
     """Replace _register_hook() function in _DistributedOptimizer with empty function."""
@@ -497,18 +607,22 @@ def _init_bsc():
 
     hijack(_DistributedOptimizer, '_register_hooks')
 
+
 def Scheduled_Optimizer(model,
-                         optimizer, named_parameters=None,
-                         compression=Compression.none,
-                         backward_passes_per_step=1,
-                         op=Average,
-                         gradient_predivide_factor=1.0,
-                         num_groups=0, groups=None,
-                         sparse_as_dense=False,
-                         num_steps=10**6):
+                        optimizer, named_parameters=None,
+                        compression=Compression.none,
+                        backward_passes_per_step=1,
+                        op=Average,
+                        gradient_predivide_factor=1.0,
+                        num_groups=0, groups=None,
+                        sparse_as_dense=False,
+                        num_steps=10**6,
+                        **kwargs):
     """Wrap Torch optimizer using Horovod DistributedOptimizer and _Scheduler."""
-    hvd_opt = _hvd_DistributedOptimizer(optimizer, named_parameters, compression, backward_passes_per_step)
-    return _Scheduled_Optimizer(model, hvd_opt, num_steps)
+    hvd_opt = _hvd_DistributedOptimizer(
+        optimizer, named_parameters, compression, backward_passes_per_step)
+    return _Scheduled_Optimizer(model, hvd_opt, num_steps, **kwargs)
+
 
 _init_logger()
 _init_bsc()
