@@ -27,7 +27,7 @@ class TernCompressor(Compressor):
         self.is_compressed = {}
         self.acc_compensate_cache = {}
         self.index_el = 0
-        self.shape{}
+        self.shape = {}
 
     def get_max_scaler(self, tensor, name):
         scaler = tensor.max().abs().view(1)
@@ -43,7 +43,7 @@ class TernCompressor(Compressor):
         if self.compensate_factor:
             compensate_tensor = sign_tensor
             compensate_tensor[rnd_sample < abs_tensor] = 0
-            self..acc_compensate_cache[name] = compensate_tensor
+            self.acc_compensate_cache[name] = compensate_tensor
         sign_tensor[rnd_sample >= abs_tensor] = 0
         return sign_tensor
 
@@ -56,7 +56,7 @@ class TernCompressor(Compressor):
                             encoded_data, \
                             self.shift_factor, \
                             rounding_mode='floor') % \
-                  mul_factor for shift_factor in TernCompressor.shift_factors]
+                  shift_factor for shift_factor in TernCompressor.shift_factors]
         decoded_summed_data = torch.gather(torch.cat(splits, 0), 0, index_original).view(shape)
         decoded_summed_data = decoded_summed_data.sub_(size()).type(torch.float)
         return decoded_summed_data * scaler / size()
@@ -87,7 +87,7 @@ class TernCompressor(Compressor):
             self.index_el += 1
             self.is_compressed[name] = 0
         else:
-            self.is_compressed[name] = is_compressed(name)
+            self.is_compressed[name] = self.is_compressed(name)
         if self.is_compressed[name]:
             tensor_compressed = tensor.flatten().requires_grad = False
             if self.compensate_factor and name in self.acc_compensate_cache:

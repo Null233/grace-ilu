@@ -42,11 +42,11 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         #                        named_parameters=model.named_parameters(),
         #                        num_steps= len(train_loader)/args.batch_size * args.epochs,
         #                        kwargs=kwargs)
-        self._warm_up = False if kwargs.get(
-            'warm_up') is None else kwargs.get('warm_up')
-        if(self._warm_up):
-            self._warm_up_params = kwargs
-            self._do_warm_up()
+        # self._warm_up = False if kwargs.get(
+        #     'warm_up') is None else kwargs.get('warm_up')
+        # if(self._warm_up):
+        #     self._warm_up_params = kwargs
+        #     self._do_warm_up()
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.info("Scheduler is enabled.")
@@ -56,9 +56,12 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._step = 0
         self._final_step = num_steps
 
-        self._clipping_size = 4096
-        self._window_size = 20
+        self._clipping_size = 2048
+        self._window_size = 5
+        self._current_size=0
         self._time_model = {}
+
+        self._handle_to_name = {}
 
         if self.op == Average:
             self.prescale_factor = 1.0 / self.gradient_predivide_factor
@@ -81,7 +84,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._completion_cache = {}  # KEY: parameter; VALUE: [outputs]
 
             self._completion_lock = threading.Lock()
-            self._completion_queue = queue.Queue(maxsize=self._window_size)
+            self._completion_queue = queue.Queue()
 
             self._completion_poller = threading.Thread(target=self._completion_poll,
                                                        name="COMPLETION_POLLER", args=())
@@ -231,10 +234,11 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
+        self._clipping_chunks[p] = 1
         self._logger.debug("{} calls instant allreduce_async_ for {}".format(
             self._desc, self._get_parameter_name(p)))
         # Add to queue to poll completion
-        self._completion_queue.put((p, handle, ctx))
+        self._completion_queue.put_nowait((p, handle, ctx))
         return handle, ctx
 
     def _scheduled_allreduce_grad_async(self, p):
@@ -264,58 +268,57 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
     def _completion_poll(self):
         """Poll the completion of the tensor's backward or allreduce from a FIFO completion_queue"""
         while True:
-            try:
-                with self._completion_lock:
-                    p, handle, ctx = self._completion_queue.get_nowait()
-                    if p is None:
-                        self._logger.debug("poller exits.")
-                        break
-                    if not (handle is not None and poll(handle)):
-                        self._completion_queue.put_nowait((p, handle, ctx))
-                        continue
-            except:
-                continue
-            output = synchronize(handle)
-            if not self._completion_cache.get(p):
-                self._completion_cache[p] = [output]
+            p, handle, ctx = self._completion_queue.get()
+            if p is None:
+                self._logger.debug("poller exits.")
+                break
+            if handle is not None and poll(handle):
+                output = synchronize(handle)
+                if self._scheduler:
+                    if not self._completion_cache.get(p):
+                        self._completion_cache[p] = [output]
+                    else:
+                        self._completion_cache[p].append(output)
+                    if len(self._completion_cache[p]) == self._clipping_chunks[p]:
+                        output = self._tensor_aggregation(p, self._completion_cache[p])
+                        p.grad.set_(self._compression.decompress(output, ctx))
+                        self._logger.debug("{} {} finished allreduce".format(
+                            self._desc, self._get_parameter_name(p)))
+                        self._allreduce_delay[p] = self.backward_passes_per_step
+                        self._update_gradient(p)
+                        self._completion_cache[p] = []
+                        if p in self._locks:
+                            self._locks[p].release()
+                else:
+                    p.grad.set_(self._compression.decompress(output, ctx))
+                    self._logger.debug("{} {} finished allreduce".format(
+                        self._desc, self._get_parameter_name(p)))
+                    self._allreduce_delay[p] = self.backward_passes_per_step
+                    self._update_gradient(p)
+                    if p in self._locks:
+                        self._locks[p].release()
             else:
-                self._completion_cache[p].append(output)
-            if len(self._completion_cache[p]) == self._clipping_chunks[p]:
-                output = self._tensor_aggregation(p, self._completion_cache[p])
-                p.grad.set_(self._compression.decompress(output, ctx))
-                self._logger.debug("{} {} finished allreduce".format(
-                    self._desc, self._get_parameter_name(p)))
-                self._allreduce_delay[p] = self.backward_passes_per_step
-                self._update_gradient(p)
-                self._completion_cache[p] = []
-                # notify update completion and parameter is ready for forward propagation
-                if p in self._locks:
-                    self._locks[p].release()
+                self._completion_queue.put_nowait((p, handle, ctx))
 
     def _submission_poll(self):
         while True:
-            with self._completion_lock:
-                if not self._completion_queue.full():
-                    try:
-                        p, tensor, ctx, offset = self._submission_queue.get_nowait()
-                    except:
-                        continue
-                    self._logger.debug("{} submission poll got {} chunk {}".format(
-                        self._desc, self._get_parameter_name(p), offset))
-                    name = self._get_parameter_name(p) + '_' + str(offset)
-                    self._logger.debug(
-                        "{} put to completion queue {}".format(self._desc, name))
-                    handle = allreduce_async_(tensor, name=name, op=self.op,
-                                              prescale_factor=self.prescale_factor,
-                                              postscale_factor=self.postscale_factor)
-                    self._completion_queue.put_nowait((p, handle, ctx))
-                    if self._handles.get(p) is not None:
-                        (p_handles, p_ctx, enqueued) = self._handles[p]
-                        p_handles = [] if p_handles is None else p_handles + [handle]
-                        self._handles[p] = (p_handles, p_ctx, enqueued)
-                    else:
-                        self._handles[p] = ([handle], ctx, True)
-            # time.sleep(0.005)
+            p, tensor, ctx, offset = self._submission_queue.get()
+            self._logger.debug("{} submission poll got {} chunk {}".format(
+                self._desc, self._get_parameter_name(p), offset))
+            name = self._get_parameter_name(p) + '_' + str(offset)
+            self._logger.debug(
+                "{} put to completion queue {}".format(self._desc, name))
+            handle = allreduce_async_(tensor, name=name, op=self.op,
+                                        prescale_factor=self.prescale_factor,
+                                        postscale_factor=self.postscale_factor)
+            self._handle_to_name[handle] = name
+            self._completion_queue.put((p, handle, ctx))
+            if self._handles.get(p) is not None:
+                (p_handles, p_ctx, enqueued) = self._handles[p]
+                p_handles = [] if p_handles is None else p_handles + [handle]
+                self._handles[p] = (p_handles, p_ctx, enqueued)
+            else:
+                self._handles[p] = ([handle], ctx, True)
 
     """Below are tensor clipping and aggregation"""
 
