@@ -31,7 +31,17 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
         self._model = model
         self._opt = hvd_opt
-        self._scheduler = False
+        self._scheduler = True
+
+        if self._scheduler:
+            # number of clipped tensors of a certain tensor is
+            # p.grad.numel() // self._clipping_size + 1.
+            # Clipped tensor has its own handle.
+            # The instant_allreduce method will be exposed to compression algorithm.
+            self._clipping_size = 4096
+            self._clipping_template = {name: param.numel() // self._clipping_size + 1
+                                       for name, param in self._model.named_parameters()
+                                       }
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.info("Scheduler is enabled.")
@@ -54,6 +64,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 self._locks[p] = threading.Lock()
 
         if size() > 1:
+            self._tensor_cache = queue.LifoQueue()
             self._forward_start_times = []
             self._step_called_times = []
             self._register_forward_hooks()
@@ -84,19 +95,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 "Invalid optimizer! Only support SGD, Adam and RMSprop.")
         self._zero_one_grad(p)
 
-    """Overwrite zero_grad function in horovod._DistributedOptimizer"""
-
-    def zero_grad(self):
-        """Override the default zero_grad function.
-        Clears the gradients of all optimized tensors.
-        """
-        # self._logger.debug(
-        #     "{} calls zero_grad() of step {}".format(self._desc, self._step))
-        if size() > 1 and self._step > 0:
-            return
-        else:
-            self._opt.zero_grad()
-
     def _zero_one_grad(self, p):
         """Clears the gradient of one variable as torch accumulates gradients by default.
         Arguments:
@@ -106,22 +104,18 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             p.grad.detach_()
             p.grad.zero_()
 
-    """Below are actual communication methods"""
+    """Actual API for user to call during training process"""
 
-    def _synchronize(self):
-        """Allreduce missing parameters"""
-        missing_p = self._requires_update - set(self._handles.keys())
-        for p in missing_p:
-            handle, ctx = self._instant_allreduce_grad_async(p)
-            self._handles[p] = (handle, ctx, True)
-
-        for p, value in self._handles.items():
-            handle, ctx, enqueued = value
-            if handle is None and not enqueued:
-                handle, ctx = self._instant_allreduce_grad_async(p)
-                self._logger.debug("None handle occures at {}!".format(
-                    self._get_parameter_name(p)))
-                self._handles[p] = (handle, ctx, True)
+    def zero_grad(self):
+        """Override the default zero_grad function.
+        Clears the gradients of all optimized tensors.
+        """
+        self._logger.debug(
+            "{} calls zero_grad() of step {}".format(self._desc, self._step))
+        if size() > 1 and self._step > 0:
+            return
+        else:
+            self._opt.zero_grad()
 
     def step(self, closure=None):
         """Override the default step function."""
@@ -144,6 +138,58 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             super(self._opt.__class__, self._opt).step()
             self._step += 1
 
+    """Below are tensor clipping and aggregation"""
+
+    def _tensor_clipping(self, p, tensor):
+        """Called when tensor arrives at _scheduled_allreduce_grad_async()
+           to clip tensor into multiple tensors based on SIZE.
+           Each clipped tensor has its own handle.
+           Clipped tensors will be aggregated in _completion_poll()"""
+        tensor = tensor.flatten()
+        offset_i = 0
+        tensors = []
+        num_chunks = 0
+        while offset_i < tensor.numel():
+            next_offset_i = offset_i + self._clipping_size
+            begin = offset_i
+            end = tensor.numel() if next_offset_i > tensor.numel() else next_offset_i
+            tensors.append(tensor.data[begin:end])
+            offset_i = next_offset_i
+            num_chunks += 1
+        self._clipping_chunks[p] = num_chunks
+        return tensors
+
+    """TODO: Consider alter out-of-place reshape to in-place"""
+    def _tensor_aggregation(self, p, clipped_tensors):
+        # Using LIFO Queue as submission queue will insert clipped tensors in reverse
+        clipped_tensors.reverse()
+        shape = p.grad.shape
+        agg_tensor = torch.cat(clipped_tensors, 0)
+        return agg_tensor.view(shape)
+
+    """Below are actual communication methods"""
+
+    def _synchronize(self):
+        """Allreduce missing parameters"""
+        self._logger.debug(
+            "{} starts synchronization".format(self._desc))
+        while not self._tensor_cache.empty():
+            p = self._tensor_cache.get()
+            handle, ctx = self._instant_allreduce_grad_async(p)
+            self._handles[p] = (handle, ctx, True)
+        missing_p = self._requires_update - set(self._handles.keys())
+        for p in missing_p:
+            handle, ctx = self._instant_allreduce_grad_async(p)
+            self._handles[p] = (handle, ctx, True)
+
+        for p, value in self._handles.items():
+            handle, ctx, enqueued = value
+            if handle is None and not enqueued:
+                handle, ctx = self._instant_allreduce_grad_async(p)
+                self._logger.debug("None handle occures at {}!".format(
+                    self._get_parameter_name(p)))
+                self._handles[p] = (handle, ctx, True)
+
     def _instant_allreduce_grad_async(self, p):
         name = self._get_parameter_name(p)
         tensor = p.grad
@@ -151,9 +197,15 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
-        # self._logger.debug("{} calls instant allreduce_async_ for {}".format(
-        #     self._desc, self._get_parameter_name(p)))
+        self._logger.debug("{} calls instant allreduce_async_ for {}".format(
+            self._desc, self._get_parameter_name(p)))
         return handle, ctx
+
+    def _scheduled_allreduce_grad_async(self, p):
+        self._tensor_cache.put(p)
+        self._logger.debug("{} puts to tensor cache: {} ".format(
+            self._desc, self._get_parameter_name(p)))
+        return None, None
 
     def _poll_in_hook(self, p):
         handle, ctx, _ = self._handles.get(p)
@@ -185,7 +237,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._allreduce_delay[p] -= 1
             self._locks[p].acquire()
             if self._allreduce_delay[p] == 0:
-                if self._scheduler:
+                if self._scheduler and self._step > 0:
                     handle, ctx = self._scheduled_allreduce_grad_async(p)
                 else:
                     handle, ctx = self._instant_allreduce_grad_async(p)
@@ -221,22 +273,15 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         def pre_forward_hook(mod, input):
             for p in mod.parameters():
                 if p in self._handles:
-                    poll_counts = 0
                     while not self._poll_in_hook(p):
-                        poll_counts += 1
                         continue
                     del self._handles[p]
-                    if self._get_parameter_name(p) == 'conv1.weight':
-                        self._forward_start_times.append(time.perf_counter())
-                        if len(self._step_called_times):
-                            self._logger.debug(f'Sync time: {self._forward_start_times[-1]-self._step_called_times[-1]}')
                 if p not in self._locks:
                     continue
                 with self._locks[p]:
-                    # self._logger.debug("{} {} is ready.".format(
-                    #     self._desc, self._get_parameter_name(p)))
-                    pass
-            #self._logger.debug("{} starts forward {}.".format(self._desc, mod))
+                    self._logger.debug("{} {} is ready.".format(
+                        self._desc, self._get_parameter_name(p)))
+            self._logger.debug("{} starts forward {}.".format(self._desc, mod))
 
         def after_forward_hook(mod, input, result):
             pass
@@ -414,7 +459,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 
 def _init_bsc():

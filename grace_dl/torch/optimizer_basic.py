@@ -272,10 +272,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                               "optimizer.skip_synchronize() context if you use "
                               "optimizer.synchronize() in your code.")
 
-            # handle_status = {}
-            # for p, (handle, ctx) in self._handles.items():
-            #     handle_status[self._get_parameter_name(p)] = poll(handle)
-            # print(handle_status)
+            handle_status = {}
+            for p, (handle, ctx) in self._handles.items():
+                handle_status[self._get_parameter_name(p)] = poll(handle)
+            print(handle_status)
 
             self.synchronize()
         self._synchronized = False
