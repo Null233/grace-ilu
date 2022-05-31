@@ -16,6 +16,8 @@
 
 import warnings
 import os
+import time
+import queue
 
 from contextlib import contextmanager
 
@@ -23,18 +25,19 @@ import torch
 
 from horovod.torch.compression import Compression
 from horovod.torch.mpi_ops import allreduce_async_
-from horovod.torch.mpi_ops import synchronize
-from horovod.torch.mpi_ops import size
+from horovod.torch.mpi_ops import synchronize, poll
+from horovod.torch.mpi_ops import size, rank
 from horovod.torch.mpi_ops import Average
 from horovod.torch.mpi_ops import rocm_built
 
 class _DistributedOptimizer(torch.optim.Optimizer):
-    def __init__(self, params, named_parameters, compression,
+    def __init__(self, model, params, named_parameters, compression,
                  backward_passes_per_step=1, op=Average,
                  gradient_predivide_factor=1.0):
         super(self.__class__, self).__init__(params)
         self._compression = compression
         self._size = size()
+        self._model = model
 
         if named_parameters is not None:
             named_parameters = list(named_parameters)
@@ -95,7 +98,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._should_synchronize = True
 
         if size() > 1 or os.environ.get('HOROVOD_ELASTIC') == '1':
+            self._forward_start_times = []
+            self._step_called_times = []
             self._register_hooks()
+            self._register_forward_hooks()
 
     def load_state_dict(self, *args, **kwargs):
         self._handles = {}
@@ -104,6 +110,13 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         for p in self._allreduce_delay:
             self._allreduce_delay[p] = self.backward_passes_per_step
         super(self.__class__, self).load_state_dict(*args, **kwargs)
+
+    def _get_parameter_name(self, p):
+        if self._is_tensor_instance:
+            name = self._parameter_names.get(p.__hash__())
+        else:
+            name = self._parameter_names.get(p)
+        return name
 
     @staticmethod
     def find_duplicates(lst):
@@ -136,7 +149,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             # as one of the other ranks may have computed it (due to dynamic forward functions).
             p.grad = p.data.new(p.size()).zero_()
 
-        name = self._parameter_names.get(p)
+        name = self._get_parameter_name(p)
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
 
@@ -172,6 +185,32 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 handle, ctx = self._allreduce_grad_async(p)
             self._handles[p] = (handle, ctx)
         return hook
+
+    def _register_forward_hooks(self):
+        """Add hook before forward propagation of each layer to block forward computation until the allreduce and
+        parameter update is finished. The blocking is implemented using a lock."""
+        # Recursively find all submodules
+        submodules = []
+        q = queue.LifoQueue()
+        for mod in self._model.children():
+            q.put(mod)
+        while not q.empty():
+            mod = q.get()
+            if len(list(mod.children())) == 0:
+                submodules.append(mod)
+            else:
+                for m in mod.children():
+                    q.put(m)
+
+        def pre_forward_hook(mod, input):
+            for p in mod.parameters():
+                if self._get_parameter_name(p) == 'conv1.weight':
+                    self._forward_start_times.append(time.perf_counter())
+                    # if len(self._step_called_times):
+                    #     print(f'Sync time: {self._forward_start_times[-1]-self._step_called_times[-1]}')
+
+        for mod in reversed(submodules):
+            mod.register_forward_pre_hook(pre_forward_hook)
 
     def synchronize(self):
         completed = set()
@@ -232,8 +271,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                               "slowdown. You may want to consider using "
                               "optimizer.skip_synchronize() context if you use "
                               "optimizer.synchronize() in your code.")
+
+            # handle_status = {}
+            # for p, (handle, ctx) in self._handles.items():
+            #     handle_status[self._get_parameter_name(p)] = poll(handle)
+            # print(handle_status)
+
             self.synchronize()
         self._synchronized = False
+        self._step_called_times.append(time.perf_counter())
         return super(self.__class__, self).step(closure)
 
     def zero_grad(self):
@@ -244,7 +290,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return super(self.__class__, self).zero_grad()
 
 
-def DistributedOptimizer(optimizer, named_parameters=None,
+def DistributedOptimizer(model, optimizer, named_parameters=None,
                          compression=Compression.none,
                          backward_passes_per_step=1,
                          op=Average,
@@ -304,5 +350,5 @@ def DistributedOptimizer(optimizer, named_parameters=None,
 
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                 dict(_DistributedOptimizer.__dict__))
-    return cls(optimizer.param_groups, named_parameters, compression, backward_passes_per_step, op,
+    return cls(model, optimizer.param_groups, named_parameters, compression, backward_passes_per_step, op,
                 gradient_predivide_factor)
