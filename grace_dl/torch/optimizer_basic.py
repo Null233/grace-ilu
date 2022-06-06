@@ -203,11 +203,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     q.put(m)
 
         def pre_forward_hook(mod, input):
-            for p in mod.parameters():
-                if self._get_parameter_name(p) == 'conv1.weight':
-                    self._forward_start_times.append(time.perf_counter())
-                    # if len(self._step_called_times):
-                    #     print(f'Sync time: {self._forward_start_times[-1]-self._step_called_times[-1]}')
+            # for p in mod.parameters():
+            #     if self._get_parameter_name(p) == 'conv1.weight':
+            #         self._forward_start_times.append(time.perf_counter())
+            #         if len(self._step_called_times):
+            #             print(f'Sync time: {self._forward_start_times[-1]-self._step_called_times[-1]}')
+            pass
 
         for mod in reversed(submodules):
             mod.register_forward_pre_hook(pre_forward_hook)
@@ -272,10 +273,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                               "optimizer.skip_synchronize() context if you use "
                               "optimizer.synchronize() in your code.")
 
-            handle_status = {}
-            for p, (handle, ctx) in self._handles.items():
-                handle_status[self._get_parameter_name(p)] = poll(handle)
-            print(handle_status)
+            # handle_status = {}
+            # for p, (handle, ctx) in self._handles.items():
+            #     handle_status[self._get_parameter_name(p)] = poll(handle)
+            # print(handle_status)
 
             self.synchronize()
         self._synchronized = False
