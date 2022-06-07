@@ -30,7 +30,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
         self._model = model
         self._opt = hvd_opt
-        self._scheduler = True
+        self._scheduler = False
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.debug(" size {}, rank {}".format(size(), rank()))
@@ -44,9 +44,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._scheduler_template = {} # KEY: layer_name; VALUE: ([tensors to converge], [tensors to split])
             self._logger.info("Scheduler is enabled.")
             size_ = max([param.numel() for param in self._model.parameters()])
-            self._splitting_size = size_ // 2
+            self._splitting_size = 131072
             self._time_model = []
-            self._window_size = 1
+            self._window_size = 4
             self._p_to_group = {}
             self._group_counts = {}
 
@@ -347,9 +347,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         def pre_forward_hook(mod, input):
             for p in mod.parameters():
                 if p in self._handles:
+                    time_start_polling = time.perf_counter()
                     while not self._poll_in_hook(p):
                         continue
                     del self._handles[p]
+                    time_end_polling = time.perf_counter()
+                    self._logger.debug("{} {} waits for {}".format(
+                        self._desc, self._get_parameter_name(p), time_end_polling - time_start_polling))
                 if p not in self._locks:
                     continue
                 with self._locks[p]:
@@ -399,7 +403,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         buf.mul_(momentum).add_(d_p)
                     else:
                         buf = param_state['momentum_buffer']
-                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                        buf.mul_(momentum).add_(d_p, alpha = 1 - dampening)
                     if nesterov:
                         d_p = d_p.add(momentum, buf)
                     else:
@@ -533,7 +537,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 
 def _init_bsc():
