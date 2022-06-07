@@ -1,6 +1,31 @@
 def grace_from_params(params):
     import horovod.torch as hvd
     world_size = hvd.size()
+    option = params.get('option', 'none')
+    if option == 'none':
+        params = {'compressor': 'none',          'memory': 'none',     'communicator': 'allreduce'}
+    elif option == 'terngrad':
+        params = {'compressor': 'terngrad',      'memory': 'none',     'communicator': 'allgather'}
+    elif option == 'ternallreduce':
+        params = {'compressor': 'ternallreduce', 'memory': 'none',     'communicator': 'allreduce'}
+    elif option == 'powersgd':
+        params = {'compressor': 'powersgd',      'memory': 'powersgd', 'communicator': 'allreduce'}
+    elif option == 'dgc':
+        params = {'compressor': 'dgc',           'memory': 'dgc',      'communicator': 'allgather'}
+    elif option == 'fp16':
+        params = {'compressor': 'fp16',          'memory': 'none',     'communicator': 'allreduce'}
+    elif option == 'qsgd':
+        params = {'compressor': 'qsgd',          'memory': 'none',     'communicator': 'allgather'}
+    elif option == 'randomk':
+        params = {'compressor': 'randomk',       'memory': 'none',     'communicator': 'allgather'}
+    elif option == 'signsgd':
+        params = {'compressor': 'signsgd',       'memory': 'none',     'communicator': 'allgather'}
+    elif option == 'signum':
+        params = {'compressor': 'signum',        'memory': 'none',     'communicator': 'allgather'}
+    elif option == 'topk':
+        params = {'compressor': 'topk',          'memory': 'none',     'communicator': 'allgather'}
+    else:
+        raise NameError()
     comp = params.get('compressor', 'none')
     mem = params.get('memory', 'none')
     comm = params.get('communicator', 'allreduce')
