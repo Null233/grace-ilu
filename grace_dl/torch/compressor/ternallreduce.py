@@ -1,7 +1,8 @@
 import torch
 
 from grace_dl.torch import Compressor
-from horovod.torch.mpi_ops import allgather
+from horovod.torch import allgather, allgather_async, synchronize
+from horovod.torch import allreduce_, allreduce_async
 from horovod.torch import size
 
 
@@ -26,13 +27,17 @@ class TernCompressor(Compressor):
         self.model_layer_threshold = model_layer_threshold
         self.layer_params = {}
         self.index_el = 0
+        self.enable_async = True
 
     def get_max_scaler(self, tensor, name):
         scaler = tensor.abs().max().view(1)
         scaler_name = f'{name}.scaler'
-        scalers = allgather(scaler, scaler_name)
-        unified_scaler = scalers.max().item()
-        return unified_scaler
+        if self.enable_async:
+            handle = allreduce_async(scaler, scaler_name)
+        else:
+            scaler = allreduce_(scaler, scaler_name).max()
+            handle = None
+        return scaler.item(), handle
 
     def stochastical_binarize_tensor(self, tensor, scaler):
         zeros = torch.zeros_like(tensor)
@@ -75,19 +80,22 @@ class TernCompressor(Compressor):
         unified_scaler = 0
         self.layer_params[name] = self.layer_params.get(name, self.index_el)
         self.index_el += 1
+        handle = None
         if tensor.numel() > self.tensor_size_threshold and \
                 self.layer_params.get(name) > len(self.layer_params) * (1-self.model_layer_threshold):
             tensor_compressed = tensor_clamp(tensor_compressed.flatten())
-            unified_scaler = self.get_max_scaler(tensor_compressed, name)
+            unified_scaler, handle = self.get_max_scaler(tensor_compressed, name)
             tensor_compressed = self.ternary_encoder(
                 tensor_compressed, unified_scaler)
             is_compressed = True
-        return [tensor_compressed], (ctx, shape, unified_scaler, is_compressed)
+        return [tensor_compressed], (ctx, shape, unified_scaler, is_compressed, handle)
 
     def decompress(self, tensors, ctx, name):
         tensor_decompressed, = tensors
-        dtype, shape, scaler, is_compressed = ctx
+        dtype, shape, scaler, is_compressed, handle = ctx
         if is_compressed:
+            if handle is not None:
+                scaler = synchronize(handle).max().item()
             tensor_decompressed = self.ternary_decoder(
                 tensor_decompressed, scaler, shape)
         return tensor_decompressed
