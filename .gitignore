@@ -8,3 +8,4 @@ data-1
 *.txt
 /*.py
 *.json
+patch_files/

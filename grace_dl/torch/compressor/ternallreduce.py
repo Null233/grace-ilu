@@ -1,7 +1,7 @@
 import torch
 
 from grace_dl.torch import Compressor
-from horovod.torch import allreduce_, allgather
+from horovod.torch.mpi_ops import allgather
 from horovod.torch import size
 
 
@@ -17,46 +17,32 @@ class TernCompressor(Compressor):
     """Quantize all floating point to ternary from."""
 
     def __init__(self, tensor_size_threshold, model_layer_threshold, compress_rate, compensate_factor):
-        super().__init__()
-        self.tensor_size_threshold = tensor_size_threshold
-        self.model_layer_threshold = model_layer_threshold
+        super().__init__(average=False)
         self.compress_rate = compress_rate
-        mul_factor = pow(2, 32//self.compress_rate)
+        mul_factor = pow(2, 32//compress_rate)
         self.shift_factors = [pow(mul_factor, i)
-                              for i in range(self.compress_rate)]
-        self._sto_factor = True
-        self.compensate_factor = compensate_factor
-        self.numels = {}
-        self.is_compressed = {}
-        self.acc_compensate_cache = {}
-        self.index_el = 0
-        self.shape = {}
-        self.scalers = {}
+                              for i in range(compress_rate)]
 
     def get_max_scaler(self, tensor, name):
-        scaler = tensor.max().abs().view(1)
+        scaler = tensor.abs().max().view(1)
         scaler_name = f'{name}.scaler'
         scalers = allgather(scaler, scaler_name)
-        unified_scaler = scalers.max()
-        return scaler.item()
+        unified_scaler = scalers.max().item()
+        return unified_scaler
 
-    def stochastical_binarize_tensor(self, tensor, scaler, name):
+    def stochastical_binarize_tensor(self, tensor, scaler):
+        zeros = torch.zeros_like(tensor)
         abs_tensor = torch.abs(tensor)
         sign_tensor = torch.sign(tensor)
         rnd_sample = torch.rand_like(tensor) * scaler
-        if self.compensate_factor:
-            compensate_tensor = sign_tensor
-            compensate_tensor[rnd_sample < abs_tensor] = 0
-            self.acc_compensate_cache[name] = compensate_tensor
-        sign_tensor[rnd_sample >= abs_tensor] = 0
+        where_cond = torch.less(rnd_sample, abs_tensor)
+        sign_tensor = torch.where(where_cond, sign_tensor, zeros)
         return sign_tensor
 
-    def ternary_decoder(self, encoded_data, shape, name):
+    def ternary_decoder(self, encoded_data, scaler, shape):
         """Decoding the signs to float format """
-        scaler = self.scalers.get(name)
-        del self.scalers[name]
         numel = torch.prod(torch.tensor(shape))
-        index_original = torch.arange(0, numel, device='cuda')
+        index_original = torch.arange(0, numel, device=encoded_data.device)
         splits = [torch.div(
             encoded_data,
             shift_factor,
@@ -68,51 +54,31 @@ class TernCompressor(Compressor):
             size()).type(torch.float)
         return decoded_summed_data * scaler / size()
 
-    def ternary_encoder(self, tensor, scaler, name):
-        tensor = self.stochastical_binarize_tensor(tensor, scaler, name)
+    def ternary_encoder(self, tensor, scaler):
+        tensor = self.stochastical_binarize_tensor(tensor, scaler)
         sum_all = 0
         e = torch.sign(tensor).type(torch.int) + 1
         redundant_size = self.compress_rate - \
             e.size(dim=0) % self.compress_rate
         e = torch.cat(
-            (e, torch.zeros(redundant_size, dtype=torch.int, device='cuda')), 0)
+            (e, torch.zeros(redundant_size, dtype=torch.int, device=tensor.device)), 0)
         for split, shift_factor in zip(torch.chunk(e, self.compress_rate), self.shift_factors):
             sum_all += split * shift_factor
         return sum_all
 
-    def _is_compressed(self, name):
-        return self.numels[name][0] > self.tensor_size_threshold and \
-            self.numels[name][1] > len(
-                self.numels)*(1-self.model_layer_threshold)
-
     def compress(self, tensor, name):
         shape = tensor.shape
-        self.shape[name] = shape
         ctx = tensor.dtype
-        if not self.numels.get(name):
-            self.numels[name] = (tensor.numel(), self.index_el)
-            self.index_el += 1
-            self.is_compressed[name] = 0
-        else:
-            self.is_compressed[name] = self._is_compressed(name)
-        if self.is_compressed[name]:
-            tensor_compressed = tensor.flatten()
-            if self.compensate_factor and name in self.acc_compensate_cache:
-                tensor_compressed.add_(self.acc_compensate_cache[name])
-            tensor_compressed = tensor_clamp(tensor_compressed)
-            unified_scaler = self.get_max_scaler(tensor_compressed, name)
-            self.scalers[name] = unified_scaler
-            tensor_compressed = self.ternary_encoder(
-                tensor_compressed, unified_scaler, name)
-            return [tensor_compressed], ctx
-        else:
-            return [tensor], ctx
+        tensor_compressed = tensor_clamp(tensor.flatten())
+        unified_scaler = self.get_max_scaler(tensor_compressed, name)
+        tensor_compressed = self.ternary_encoder(
+            tensor_compressed, unified_scaler)
+        return [tensor_compressed], (ctx, shape, unified_scaler)
+        # return [tensor], (ctx, shape, unified_scaler)
 
     def decompress(self, tensors, ctx, name):
         tensor_decompressed, = tensors
-        dtype = ctx
-        shape = self.shape[name]
-        if self.is_compressed[name]:
-            tensor_decompressed = self.ternary_decoder(
-                tensor_decompressed, shape, name)
+        dtype, shape, scaler = ctx
+        tensor_decompressed = self.ternary_decoder(
+            tensor_decompressed, scaler, shape)
         return tensor_decompressed
