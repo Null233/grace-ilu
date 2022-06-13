@@ -22,6 +22,10 @@ class TernCompressor(Compressor):
         self.mul_factor = pow(2, 32//compress_rate)
         self.shift_factors = [pow(self.mul_factor, i)
                               for i in range(compress_rate)]
+        self.tensor_size_threshold = tensor_size_threshold
+        self.model_layer_threshold = model_layer_threshold
+        self.layer_params = {}
+        self.index_el = 0
 
     def get_max_scaler(self, tensor, name):
         scaler = tensor.abs().max().view(1)
@@ -66,16 +70,24 @@ class TernCompressor(Compressor):
     def compress(self, tensor, name):
         shape = tensor.shape
         ctx = tensor.dtype
-        tensor_compressed = tensor_clamp(tensor.flatten())
-        unified_scaler = self.get_max_scaler(tensor_compressed, name)
-        tensor_compressed = self.ternary_encoder(
-            tensor_compressed, unified_scaler)
-        return [tensor_compressed], (ctx, shape, unified_scaler)
-        # return [tensor], (ctx, shape, unified_scaler)
+        is_compressed = False
+        tensor_compressed = tensor
+        unified_scaler = 0
+        self.layer_params[name] = self.layer_params.get(name, self.index_el)
+        self.index_el += 1
+        if tensor.numel() > self.tensor_size_threshold and \
+                self.layer_params.get(name) > len(self.layer_params) * (1-self.model_layer_threshold):
+            tensor_compressed = tensor_clamp(tensor_compressed.flatten())
+            unified_scaler = self.get_max_scaler(tensor_compressed, name)
+            tensor_compressed = self.ternary_encoder(
+                tensor_compressed, unified_scaler)
+            is_compressed = True
+        return [tensor_compressed], (ctx, shape, unified_scaler, is_compressed)
 
     def decompress(self, tensors, ctx, name):
         tensor_decompressed, = tensors
-        dtype, shape, scaler = ctx
-        tensor_decompressed = self.ternary_decoder(
-            tensor_decompressed, scaler, shape)
+        dtype, shape, scaler, is_compressed = ctx
+        if is_compressed:
+            tensor_decompressed = self.ternary_decoder(
+                tensor_decompressed, scaler, shape)
         return tensor_decompressed
