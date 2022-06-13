@@ -19,8 +19,8 @@ class TernCompressor(Compressor):
     def __init__(self, tensor_size_threshold, model_layer_threshold, compress_rate, compensate_factor):
         super().__init__(average=False)
         self.compress_rate = compress_rate
-        mul_factor = pow(2, 32//compress_rate)
-        self.shift_factors = [pow(mul_factor, i)
+        self.mul_factor = pow(2, 32//compress_rate)
+        self.shift_factors = [pow(self.mul_factor, i)
                               for i in range(compress_rate)]
 
     def get_max_scaler(self, tensor, name):
@@ -43,11 +43,8 @@ class TernCompressor(Compressor):
         """Decoding the signs to float format """
         numel = torch.prod(torch.tensor(shape))
         index_original = torch.arange(0, numel, device=encoded_data.device)
-        splits = [torch.div(
-            encoded_data,
-            shift_factor,
-            rounding_mode='floor') %
-            shift_factor for shift_factor in self.shift_factors]
+        splits = [torch.div(encoded_data, shift_factor, rounding_mode='floor') %
+            self.mul_factor for shift_factor in self.shift_factors]
         decoded_summed_data = torch.gather(
             torch.cat(splits, 0), 0, index_original).view(shape)
         decoded_summed_data = decoded_summed_data.sub_(

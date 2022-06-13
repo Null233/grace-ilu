@@ -16,7 +16,7 @@
 
 from horovod.common.util import check_extension
 
-__file__ = '/usr/lib/python3/dist-packages/horovod/torch/'
+__file__ = '/usr/local/lib/python3.8/dist-packages/horovod/torch/'
 
 # try:
 #     check_extension('horovod.torch', 'HOROVOD_WITH_PYTORCH',

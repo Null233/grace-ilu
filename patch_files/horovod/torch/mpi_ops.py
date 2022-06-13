@@ -23,7 +23,7 @@ import warnings
 from horovod.torch import mpi_lib_v2 as mpi_lib
 from horovod.common.basics import HorovodBasics as _HorovodBasics
 _NULL = ""
-__file__ = '/usr/lib/python3/dist-packages/horovod/torch/'
+__file__ = '/usr/local/lib/python3.8/dist-packages/horovod/torch/'
 _basics = _HorovodBasics(__file__, 'mpi_lib_v2')
 
 from horovod.common.exceptions import HorovodInternalError
