@@ -51,6 +51,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._group_counts = {}
 
         self._step = 0
+        self._forward_step = 0
+        self._forward_model = {}
         self._final_step = num_steps
 
         if self.op == Average:
@@ -205,10 +207,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             handle = allreduce_async_(tensor, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
-            handles, _, __ = self._handles.get(p)
+            handles, ctx_, enqueued_ = self._handles.get(p)
             if handles is not None:
                 handles.append(handle)
-                self._handles[p] = (handles, _, __)
+                self._handles[p] = (handles, ctx_, enqueued_)
             else:
                 self._handles[p] = ([handle], ctx, True)
         missing_p = self._requires_update - set(self._handles.keys())
@@ -345,6 +347,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     q.put(m)
 
         def pre_forward_hook(mod, input):
+            self._forward_model[mod] = self._forward_model.get(mod, []) + [self._forward_step]
+            self._forward_step += 1
             for p in mod.parameters():
                 if p in self._handles:
                     time_start_polling = time.perf_counter()
