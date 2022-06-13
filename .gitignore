@@ -1,6 +1,6 @@
 build/
 test/
-patch_files/
+patch_files/horovod/
 pytorch_mnist.py
 __pycache__
 data-0/
