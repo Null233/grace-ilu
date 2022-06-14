@@ -80,7 +80,7 @@ def grace_from_params(params):
         compressor = TopKCompressor(compress_ratio)
     elif comp == 'ternallreduce':
         from grace_dl.torch.compressor.ternallreduce import TernCompressor
-        compressor = TernCompressor(4096, 0.8, 4, False)
+        compressor = TernCompressor(4096, 1, 4, False)
     else:
         raise NotImplementedError(comp)
 

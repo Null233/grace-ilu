@@ -33,11 +33,11 @@ class TernCompressor(Compressor):
         scaler = tensor.abs().max().view(1)
         scaler_name = f'{name}.scaler'
         if self.enable_async:
-            handle = allreduce_async(scaler, scaler_name)
+            handle = allgather_async(scaler, scaler_name)
         else:
-            scaler = allreduce_(scaler, scaler_name).max()
+            scaler = allreduce_(scaler, scaler_name).max().item()
             handle = None
-        return scaler.item(), handle
+        return scaler, handle
 
     def stochastical_binarize_tensor(self, tensor, scaler):
         zeros = torch.zeros_like(tensor)
