@@ -25,16 +25,11 @@ from horovod.common.util import split_list
 
 from horovod.torch.compression import Compression
 from horovod.torch.functions import broadcast_object
-from patch_files.horovod.torch.mpi_ops import allreduce_async_, grouped_allreduce_async_
-from patch_files.horovod.torch.mpi_ops import synchronize
-from patch_files.horovod.torch.mpi_ops import size
-from patch_files.horovod.torch.mpi_ops import Average, Adasum, Sum
-from patch_files.horovod.torch.mpi_ops import rocm_built
-# from horovod.torch.mpi_ops import allreduce_async_, grouped_allreduce_async_
-# from horovod.torch.mpi_ops import synchronize
-# from horovod.torch.mpi_ops import size
-# from horovod.torch.mpi_ops import Average, Adasum, Sum
-# from horovod.torch.mpi_ops import rocm_built
+from horovod.torch.mpi_ops import allreduce_async_, grouped_allreduce_async_
+from horovod.torch.mpi_ops import synchronize
+from horovod.torch.mpi_ops import size
+from horovod.torch.mpi_ops import Average, Adasum, Sum
+from horovod.torch.mpi_ops import rocm_built
 
 
 class _DistributedOptimizer(torch.optim.Optimizer):

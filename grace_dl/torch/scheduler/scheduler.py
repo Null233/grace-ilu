@@ -5,11 +5,14 @@ try:
     import queue
 except ImportError:
     import Queue as queue
+
 import time
 import math
 import torch
 
 from horovod.torch.compression import Compression
+from horovod.torch.functions import broadcast_object
+from horovod.common.util import split_list
 from horovod.torch.mpi_ops import size, rank
 from horovod.torch.mpi_ops import Average
 from horovod.torch.mpi_ops import allreduce_async_
@@ -313,14 +316,61 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._allreduce_delay[p] -= 1
             self._locks[p].acquire()
             if self._allreduce_delay[p] == 0:
-                if self._scheduler and self._step > 0:
-                    handles, ctx = self._scheduled_allreduce_grad_async(p)
+                if self._scheduler: 
+                    if self._groups is not None:
+                        group = self._p_to_group[p]
+                        self._group_counts[group] += 1
+                        if self._group_counts[group] == len(group):
+                            handle, ctxs = self._grouped_allreduce_grad_async(group)
+                            self._handles[group] = (handle, ctxs)
+                            # Remove any None entries from previous no-op hook calls
+                            for gp in group:
+                                self._handles.pop(gp, None)
+                            self._group_counts[group] = 0
+                            return
+                    else:
+                        handles, ctx = self._scheduled_allreduce_grad_async(p)
                 else:
                     handles, ctx = self._instant_allreduce_grad_async(p)
             self._handles[p] = (handles, ctx, True)
         return hook
 
     def _register_hooks(self):
+        if self._groups is not None:
+            p_list = []
+            # Get list of parameters with grads
+            for param_group in self.param_groups:
+                for p in param_group['params']:
+                    if p.requires_grad:
+                        p_list.append(p)
+
+            # To ensure parameter order and group formation is consistent, broadcast p_list order
+            # from rank 0 and use for every worker
+            p_list_names = [self._parameter_names.get(p) for p in p_list]
+            p_list_names = broadcast_object(p_list_names, root_rank=0)
+            p_list = sorted(p_list, key=lambda p: p_list_names.index(self._parameter_names.get(p)))
+
+            # Form groups
+            if isinstance(self._groups, list):
+                p_groups = []
+                grouped_id = set()
+                p_list_ids = [id(p) for p in p_list]
+                for group in self._groups:
+                    p_groups.append([p for p in group if id(p) in p_list_ids])
+                    for p in p_groups[-1]:
+                        grouped_id.add(id(p))
+                for p in p_list:
+                    if id(p) not in grouped_id:
+                        p_groups.append([p])
+            else:
+                p_groups = split_list(p_list, self._groups)
+
+            p_groups = [tuple(p) for p in p_groups]
+            for group in p_groups:
+                for p in group:
+                    self._p_to_group[p] = group
+                self._group_counts[group] = 0
+
         for param_group in self.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:
@@ -541,7 +591,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 
 def _init_bsc():
@@ -561,6 +611,7 @@ def _init_bsc():
 
 def Scheduled_Optimizer(model,
                         optimizer, named_parameters=None,
+                        grc=None,
                         compression=Compression.none,
                         backward_passes_per_step=1,
                         op=Average,
@@ -571,7 +622,7 @@ def Scheduled_Optimizer(model,
                         **kwargs):
     """Wrap Torch optimizer using Horovod DistributedOptimizer and _Scheduler."""
     hvd_opt = _hvd_DistributedOptimizer(
-        optimizer, named_parameters, compression, backward_passes_per_step)
+        optimizer, named_parameters, grc, compression, backward_passes_per_step)
     return _Scheduled_Optimizer(model, hvd_opt, num_steps, **kwargs)
 
 
