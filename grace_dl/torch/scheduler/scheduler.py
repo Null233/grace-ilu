@@ -216,6 +216,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 self._handles[p] = (handles, ctx_, enqueued_)
             else:
                 self._handles[p] = ([handle], ctx, True)
+
         missing_p = self._requires_update - set(self._handles.keys())
         for p in missing_p:
             handles, ctx = self._instant_allreduce_grad_async(p)
