@@ -1,19 +1,5 @@
 #!/bin/bash
-PREFIX=${1:-"env-tf1.15"}
-ENV_ROOT=$PWD
-CONDA_TYPE=`type -t conda`
-if [ ${CONDA_TYPE}"" == 'function' ]; then
-  : # nothing to do
-elif [ ${CONDA_TYPE}"" == 'file' ]; then
-  CONDA_HOME_PATH=$(dirname "$(dirname "`command -v conda`")")
-  . ${CONDA_HOME_PATH}/etc/profile.d/conda.sh
-else
-  echo "conda not installed or not in path"
-  exit 1
-fi
-
-conda activate ${ENV_ROOT}/${PREFIX}
-HOROVOD_PATH=`python -c "import horovod; print(horovod.__path__[0])"`
+HOROVOD_PATH=`python3 -c "import horovod; print(horovod.__path__[0])"`
 
 echo "will overwrite compression files in ${HOROVOD_PATH}"
 read -p "Continue (y/N)? " -n 1 -r

@@ -9,3 +9,5 @@ data-1/
 *.txt
 /*.py
 *.json
+*.svg
+*.csv

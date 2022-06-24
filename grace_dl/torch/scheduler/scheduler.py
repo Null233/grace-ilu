@@ -15,7 +15,7 @@ from horovod.torch.functions import broadcast_object
 from horovod.common.util import split_list
 from horovod.torch.mpi_ops import size, rank
 from horovod.torch.mpi_ops import Average
-from horovod.torch.mpi_ops import allreduce_async_
+from horovod.torch.mpi_ops import allreduce_async_, grouped_allreduce_async_
 from horovod.torch.mpi_ops import synchronize, poll
 from horovod.torch.mpi_ops import size
 
@@ -229,6 +229,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 self._logger.debug("None handle occures at {}!".format(
                     self._get_parameter_name(p)))
                 self._handles[p] = (handles, ctx, True)
+        for p, (handle, ctx) in self._handles.items():
+            if isinstance(p, tuple):
+                if self._groups is not None and self._group_counts[p] != 0:
+                    self._group_counts[p] = 0
 
     def _instant_allreduce_grad_async(self, p):
         name = self._get_parameter_name(p)
@@ -242,30 +246,34 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         return [handle], ctx
 
     def _scheduled_allreduce_grad_async(self, p):
-        name = self._get_parameter_name(p)
-        tensor = p.grad
-        tensor_compressed, ctx = self._compression.compress(tensor)
-        tensors = self._tensor_splitting(p, tensor_compressed)
-        tensors.reverse()
-        handles = []
-        if len(tensors) > self._window_size:
-            
-            tensors_to_send = tensors[0 : self._window_size]
-            tensors_to_wait = tensors[self._window_size:]
-            tensors_to_wait.reverse()
-            for t, n in tensors_to_send:
-                handle = allreduce_async_(t, name=f'{name}.{str(n)}', op=self.op,
-                                  prescale_factor=self.prescale_factor,
-                                  postscale_factor=self.postscale_factor)
-                handles.append(handle)
-            for t, n in tensors_to_wait:
-                self._tensor_cache.put((p, t, f'{name}.{str(n)}', ctx))
-        else:
-            for t, n in tensors:
-                handle = allreduce_async_(t, name=f'{name}.{str(n)}', op=self.op,
+        if type(p) is not list:
+            name = self._get_parameter_name(p)
+            tensor = p.grad
+            tensor_compressed, ctx = self._compression.compress(tensor)
+            tensors = self._tensor_splitting(p, tensor_compressed)
+            tensors.reverse()
+            handles = []
+            if len(tensors) > self._window_size:
+                tensors_to_send = tensors[0 : self._window_size]
+                tensors_to_wait = tensors[self._window_size:]
+                tensors_to_wait.reverse()
+                for t, n in tensors_to_send:
+                    handle = allreduce_async_(t, name=f'{name}.{str(n)}', op=self.op,
                                     prescale_factor=self.prescale_factor,
                                     postscale_factor=self.postscale_factor)
-                handles.append(handle)
+                    handles.append(handle)
+                for t, n in tensors_to_wait:
+                    self._tensor_cache.put((p, t, f'{name}.{str(n)}', ctx))
+            else:
+                for t, n in tensors:
+                    handle = allreduce_async_(t, name=f'{name}.{str(n)}', op=self.op,
+                                        prescale_factor=self.prescale_factor,
+                                        postscale_factor=self.postscale_factor)
+                    handles.append(handle)
+        else:
+            name = self._get_parameter_name(p[0])
+            tensors_compressed, ctxs = zip(*[self._compression.compress(p_.grad) for p_ in p])
+            handle = grouped_allreduce_async_(tensors_compressed, name=name, op=self.op)
         return handles, ctx
 
     def _poll_in_hook(self, p):
@@ -318,7 +326,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._locks[p].acquire()
             if self._allreduce_delay[p] == 0:
                 if self._scheduler: 
-                    if self._groups is not None:
+                    if self._groups is not None and self._p_to_group.get(p) is not None:
                         group = self._p_to_group[p]
                         self._group_counts[group] += 1
                         if self._group_counts[group] == len(group):
