@@ -7,9 +7,7 @@ from horovod.torch import size
 
 
 def tensor_clamp(tensor):
-    std = (tensor - torch.mean(tensor)) ** 2
-    std = torch.sqrt(torch.mean(std))
-    c = 2.5 * std.item()
+    c = 2.5 * torch.std(tensor).item()
     tensor_ = torch.clamp(tensor, -c, c)
     return tensor_
 

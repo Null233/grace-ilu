@@ -222,7 +222,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 outputs = synchronize(handle)
                 for gp, output, gctx in zip(p, outputs, ctx):
                     self._allreduce_delay[gp] = self.backward_passes_per_step
-                    gp.grad.set_(self._compression.decompress(output, gctx, name))
+                    gp.grad.set_(self._compression.decompress(output, gctx))
             else:
                 if self._grace and self._num_groups == 0 and self.op == Average:
                     # in GRACE, p is not tuple, but handle is.
@@ -232,7 +232,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 else:
                     output = synchronize(handle)
                     self._allreduce_delay[p] = self.backward_passes_per_step
-                    p.grad.set_(self._compression.decompress(output, ctx, name))
+                    p.grad.set_(self._compression.decompress(output, ctx))
         self._handles.clear()
 
         self._synchronized = True
@@ -434,7 +434,7 @@ class _DistributedAdasumOptimizer(torch.optim.Optimizer):
                 handle, ctx = self._allreduce_grad_async(p)
                 self._handles[p] = (handle, ctx)
             delta = synchronize(handle)
-            delta = self._compression.decompress(delta, ctx, name)
+            delta = self._compression.decompress(delta, ctx)
             start = self._starting_models[p]
             start.data.add_(delta.data)
             p.data.copy_(start)

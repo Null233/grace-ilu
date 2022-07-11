@@ -45,6 +45,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             # Split tensor has its own handle.
             # The instant_allreduce method will be exposed to compression algorithm.
             self._scheduler_template = {} # KEY: layer_name; VALUE: ([tensors to converge], [tensors to split])
+            self._groups = [con for (con, __) in self._scheduler_template.values()]
             self._logger.info("Scheduler is enabled.")
             size_ = max([param.numel() for param in self._model.parameters()])
             self._splitting_size = 131072
@@ -234,6 +235,13 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 if self._groups is not None and self._group_counts[p] != 0:
                     self._group_counts[p] = 0
 
+    def _grouped_allreduce_grad_async(self, ps):
+        name = self._parameter_names.get(ps[0])
+        tensors_compressed, ctxs = zip(*[self._compression.compress(p.grad) for p in ps])
+
+        handle = grouped_allreduce_async_(tensors_compressed, name=name, op=self.op)
+        return handle, ctxs
+
     def _instant_allreduce_grad_async(self, p):
         name = self._get_parameter_name(p)
         tensor = p.grad
@@ -283,24 +291,42 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         #     handle_status[self._get_parameter_name(p)] = poll(handle)
         # self._logger.debug("{} Handle status {}!".format(
         #             self._desc, handle_status))
-        ready_for_aggregation = True
-        for handle in handles:
-            ready_for_aggregation &= poll(handle)
-        if ready_for_aggregation:
-            outputs = []
+        if not isinstance(p, tuple):
+            ready_for_aggregation = True
             for handle in handles:
-                outputs.append(synchronize(handle))
-            aggregated_tensor = self._tensor_aggregation(p, outputs)
-            p.grad.set_(self._compression.decompress(aggregated_tensor, ctx))
-            self._logger.debug("{} {} finished allreduce".format(
-                self._desc, self._get_parameter_name(p)))
-            self._allreduce_delay[p] = self.backward_passes_per_step
-            self._update_gradient(p)
-            if p in self._locks:
-                self._locks[p].release()
-            return True
+                ready_for_aggregation &= poll(handle)
+            if ready_for_aggregation:
+                outputs = []
+                for handle in handles:
+                    outputs.append(synchronize(handle))
+                aggregated_tensor = self._tensor_aggregation(p, outputs)
+                p.grad.set_(self._compression.decompress(aggregated_tensor, ctx))
+                self._logger.debug("{} {} finished allreduce".format(
+                    self._desc, self._get_parameter_name(p)))
+                self._allreduce_delay[p] = self.backward_passes_per_step
+                self._update_gradient(p)
+                if p in self._locks:
+                    self._locks[p].release()
+                return True
+            else:
+                return False
         else:
-            return False
+            p, (handle, ctx), _ = self._handles.get(self._p_to_group.get(p))
+            if handle is not None:
+                outputs = synchronize(handle)
+                for gp, output, gctx in zip(p, outputs, ctx):
+                    self._allreduce_delay[gp] = self.backward_passes_per_step
+                    gp.grad.set_(self._compression.decompress(output, gctx))
+                    self._update_gradient(gp)
+                    if gp in self._locks:
+                        self._locks[gp].release()
+            else:
+                for gp in p:
+                    if gp in self._locks:
+                        self._locks[gp].release()
+                    self._logger.warning("{} {} triggers forward propagation before synchronization".format(
+                        self._desc, self._get_parameter_name(p)))
+            return True
 
     """Below are hooks used in forward propagation and backward propagation"""
 
@@ -331,7 +357,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                         self._group_counts[group] += 1
                         if self._group_counts[group] == len(group):
                             handle, ctxs = self._grouped_allreduce_grad_async(group)
-                            self._handles[group] = (handle, ctxs)
+                            self._handles[group] = (handle, ctxs, True)
                             # Remove any None entries from previous no-op hook calls
                             for gp in group:
                                 self._handles.pop(gp, None)
@@ -417,6 +443,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     time_end_polling = time.perf_counter()
                     self._logger.debug("{} {} waits for {}".format(
                         self._desc, self._get_parameter_name(p), time_end_polling - time_start_polling))
+                else:
+                    self._poll_in_hook(self._p_to_group.get(p))
                 if p not in self._locks:
                     continue
                 with self._locks[p]:

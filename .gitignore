@@ -11,3 +11,5 @@ data-1/
 *.json
 *.svg
 *.csv
+supervised_classificatin/
+runs/
