@@ -1,3 +1,4 @@
+from posixpath import split
 import threading
 import logging
 
@@ -29,11 +30,12 @@ _hvd_DistributedOptimizer = DistributedOptimizer
 
 
 class _Scheduled_Optimizer(_DistributedOptimizer):
-    def __init__(self, model, hvd_opt, num_steps=10**6, **kwargs):
+    def __init__(self, model, hvd_opt, split_size = -1, window_size = -1, num_steps=10**6, **kwargs):
 
         self._model = model
         self._opt = hvd_opt
         self._scheduler = True
+        self._enable_group = False
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.debug(" size {}, rank {}".format(size(), rank()))
@@ -46,13 +48,15 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             # The instant_allreduce method will be exposed to compression algorithm.
             self._logger.info("Scheduler is enabled.")
             size_ = max([param.numel() for param in self._model.parameters()])
-            self._splitting_size = 131072
+            self._splitting_size = size_ // 2 if split_size == -1 else split_size
             self._time_model = []
-            self._window_size = 4
+            self._window_size = 4 if window_size == -1 else window_size
             self._p_to_group = {}
             self._group_counts = {}
             self._scheduler_template = self._construct_template() # KEY: layer_name; VALUE: ([tensors to converge], [tensors to split])
-            self._groups = [con for (con, __) in self._scheduler_template.values()]
+            self._groups = [con for (con, __) in self._scheduler_template.values()] if self._enable_group else None
+            self._groups_names = [self._get_parameter_name(p) for param in self._groups for p in param]  if self._enable_group else None
+            # print(self._groups_names)
 
         self._step = 0
         self._forward_step = 0
@@ -132,6 +136,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     else:
                         tensors_to_converge.append(p)
             template[layer] = (tensors_to_converge, tensors_to_split)
+        # template = {list(ps.keys())[0]:(list(self._model.parameters()), [])}
         return template
 
     """Actual API for user to call during training process"""
@@ -191,7 +196,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     """TODO: Consider alter out-of-place reshape to in-place"""
 
-    def _tensor_aggregation(self, p, split_tensors) -> list:
+    def _tensor_aggregation(self, p, split_tensors):
         # Using LIFO Queue as submission queue will insert split tensors in reverse
         split_tensors.reverse()
         shape = p.grad.shape
@@ -304,8 +309,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         else:
             handle, ctxs, _ = self._handles.get(p)
             if handle is not None:
-                while not poll(handle):
-                    pass
                 outputs = synchronize(handle)
                 for gp, output, ctx in zip(p, outputs, ctxs):
                     self._allreduce_delay[gp] = self.backward_passes_per_step
@@ -649,11 +652,13 @@ def Scheduled_Optimizer(model,
                         num_groups=0, groups=None,
                         sparse_as_dense=False,
                         num_steps=10**6,
+                        split_size=-1,
+                        window_size=-1,
                         **kwargs):
     """Wrap Torch optimizer using Horovod DistributedOptimizer and _Scheduler."""
     hvd_opt = _hvd_DistributedOptimizer(
         optimizer, named_parameters, compression, backward_passes_per_step)
-    return _Scheduled_Optimizer(model, hvd_opt, num_steps, **kwargs)
+    return _Scheduled_Optimizer(model, hvd_opt, split_size, window_size, num_steps, **kwargs)
 
 
 _init_logger()

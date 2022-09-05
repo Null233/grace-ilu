@@ -31,7 +31,7 @@ def grace_from_params(params):
     comm = params.get('communicator', 'allreduce')
     if comp == 'dgc':
         from grace_dl.torch.compressor.dgc import DgcCompressor
-        compress_ratio = params.get('compress_ratio', 0.3)
+        compress_ratio = params.get('compress_ratio', 0.01)
         compressor = DgcCompressor(compress_ratio)
     elif comp == 'efsignsgd':
         from grace_dl.torch.compressor.efsignsgd import EFSignSGDCompressor
