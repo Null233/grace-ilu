@@ -49,6 +49,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._logger.info("Scheduler is enabled.")
             size_ = max([param.numel() for param in self._model.parameters()])
             self._splitting_size = size_ // 2 if split_size == -1 else split_size
+            self._splitting_cnt = {} # KEY: parameter; VALUE: splitting count of each parameter
             self._time_model = []
             self._window_size = 4 if window_size == -1 else window_size
             self._p_to_group = {}
@@ -192,6 +193,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             tensors.append((tensor[begin:end], num_chunks))
             offset_i = next_offset_i
             num_chunks += 1
+        self._splitting_cnt[p] = num_chunks
         return tensors
 
     """TODO: Consider alter out-of-place reshape to in-place"""
@@ -222,6 +224,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 self._handles[p] = (handles, ctx_, enqueued_)
             else:
                 self._handles[p] = ([handle], ctx, True)
+
+        # DEBUG
+        # for p, value in self._handles.items():
+        #     print(f"NAME: {self._get_parameter_name(p)}\tsplit_cnt: {self._splitting_cnt.get(p)}\thandles_size: {len(value[0])}")
 
         missing_p = self._requires_update - set(self._handles.keys())
         for p in missing_p:
@@ -288,6 +294,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
     def _poll_in_hook(self, p):
         if not isinstance(p, tuple):
             handles, ctx, _ = self._handles.get(p)
+            if self._step > 1 and len(handles) != self._splitting_cnt.get(p):
+                print(f"step: {self._step}\thandles: {len(handles)}\tcnt: {self._splitting_cnt.get(p)}")
+                return False
             ready_for_aggregation = True
             for handle in handles:
                 ready_for_aggregation &= poll(handle)
@@ -347,7 +356,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._allreduce_delay[p] -= 1
             self._locks[p].acquire()
             if self._allreduce_delay[p] == 0:
-                if self._scheduler: 
+                if self._step > 0 and self._scheduler: 
                     if self._groups is not None and self._p_to_group.get(p) is not None:
                         group = self._p_to_group[p]
                         self._group_counts[group] += 1
