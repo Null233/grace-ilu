@@ -20,6 +20,8 @@ from horovod.torch.mpi_ops import allreduce_async_, grouped_allreduce_async_
 from horovod.torch.mpi_ops import synchronize, poll
 from horovod.torch.mpi_ops import size
 
+from grace_dl.torch.scheduler.backend.backend import *
+
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 
@@ -49,7 +51,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._logger.info("Scheduler is enabled.")
             size_ = max([param.numel() for param in self._model.parameters()])
             self._splitting_size = size_ // 2 if split_size == -1 else split_size
-            self._splitting_cnt = {} # KEY: parameter; VALUE: splitting count of each parameter
+            self._splitting_cnt = {param:param.numel()//self._splitting_size + 1 for param in self._model.parameters()} # KEY: parameter; VALUE: splitting count of each parameter
             self._time_model = []
             self._window_size = 4 if window_size == -1 else window_size
             self._p_to_group = {}
@@ -182,19 +184,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             Each split tensor has its own handle.
             split tensors will be aggregated in _completion_poll()"""
         tensor = tensor.flatten()
-        offset_i = 0
-        tensors = []
-        num_chunks = 0
-        numel = tensor.numel()
-        while offset_i < numel:
-            next_offset_i = offset_i + self._splitting_size
-            begin = offset_i
-            end = next_offset_i if next_offset_i <= numel else numel
-            tensors.append((tensor[begin:end], num_chunks))
-            offset_i = next_offset_i
-            num_chunks += 1
-        self._splitting_cnt[p] = num_chunks
-        return tensors
+        tensors = _backend._tensor_clipping_cpp(tensor, self._splitting_size)
+        ts = [(tensor, i) for tensor, i in zip(tensors, range(len(tensors)))]
+        return ts
 
     """TODO: Consider alter out-of-place reshape to in-place"""
 
