@@ -32,7 +32,8 @@ _hvd_DistributedOptimizer = DistributedOptimizer
 
 
 class _Scheduled_Optimizer(_DistributedOptimizer):
-    def __init__(self, model, hvd_opt, split_size = -1, window_size = -1, num_steps=10**6, **kwargs):
+    def __init__(self, model, hvd_opt, split_size = -1, 
+                window_size = -1, num_steps=10**6, **kwargs):
 
         self._model = model
         self._opt = hvd_opt
@@ -51,14 +52,24 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._logger.info("Scheduler is enabled.")
             size_ = max([param.numel() for param in self._model.parameters()])
             self._splitting_size = size_ // 2 if split_size == -1 else split_size
-            self._splitting_cnt = {param:param.numel()//self._splitting_size + 1 for param in self._model.parameters()} # KEY: parameter; VALUE: splitting count of each parameter
+            #self._splitting_cnt: KEY: parameter; VALUE: splitting count of each parameter
+            self._splitting_cnt = {param:math.ceil(param.numel()/self._splitting_size) 
+                                        for param in self._model.parameters()} 
             self._time_model = []
             self._window_size = 4 if window_size == -1 else window_size
             self._p_to_group = {}
             self._group_counts = {}
-            self._scheduler_template = self._construct_template() # KEY: layer_name; VALUE: ([tensors to converge], [tensors to split])
-            self._groups = [con for (con, __) in self._scheduler_template.values()] if self._enable_group else None
-            self._groups_names = [self._get_parameter_name(p) for param in self._groups for p in param]  if self._enable_group else None
+            #self._scheduler_template: KEY: layer_name; VALUE: ([tensors to converge], [tensors to split])
+            self._scheduler_template = self._construct_template() 
+            self._groups = [cons 
+                                for (cons, __) in self._scheduler_template.values()
+                           ] if self._enable_group else None
+            # for cons in self._groups:
+            #     for p in cons:
+            #         print(f"Name: {self._get_parameter_name(p)}\tSize: {p.numel()}")
+            self._groups_names = [self._get_parameter_name(p) 
+                                    for param in self._groups for p in param
+                                 ] if self._enable_group else None
             # print(self._groups_names)
 
         self._step = 0
@@ -134,10 +145,12 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for p_name, p in ps.items():
                 p_layer = p_name.split('.')[0]
                 if p_layer == layer:
-                    if p.numel() >= self._splitting_size:
+                    if p.numel() > self._splitting_size:
                         tensors_to_split.append(p)
+                        # print(f"Split: {self._get_parameter_name(p)}\tsize: {p.numel()}")
                     else:
                         tensors_to_converge.append(p)
+                        # print(f"Conve: {self._get_parameter_name(p)}\tsize: {p.numel()}")
             template[layer] = (tensors_to_converge, tensors_to_split)
         # template = {list(ps.keys())[0]:(list(self._model.parameters()), [])}
         return template
@@ -191,8 +204,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
     """TODO: Consider alter out-of-place reshape to in-place"""
 
     def _tensor_aggregation(self, p, split_tensors):
-        # Using LIFO Queue as submission queue will insert split tensors in reverse
-        split_tensors.reverse()
         shape = p.grad.shape
         agg_tensor = torch.cat(split_tensors, 0)
         return agg_tensor.view(shape)
@@ -262,7 +273,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
         tensors = self._tensor_splitting(p, tensor_compressed)
-        tensors.reverse()
         handles = []
         if len(tensors) > self._window_size:
             tensors_to_send = tensors[0 : self._window_size]
@@ -287,7 +297,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         if not isinstance(p, tuple):
             handles, ctx, _ = self._handles.get(p)
             if self._step > 1 and len(handles) != self._splitting_cnt.get(p):
-                print(f"step: {self._step}\thandles: {len(handles)}\tcnt: {self._splitting_cnt.get(p)}")
+                # print(f"step: {self._step}\thandles: {len(handles)}\tcnt: {self._splitting_cnt.get(p)}\tname: {self._get_parameter_name(p)}\tnumel: {p.grad.numel()}")
                 return False
             ready_for_aggregation = True
             for handle in handles:
@@ -350,6 +360,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             if self._allreduce_delay[p] == 0:
                 if self._step > 0 and self._scheduler: 
                     if self._groups is not None and self._p_to_group.get(p) is not None:
+                        if(p.grad.numel() > self._splitting_size):
+                            print(f"p {p.numel()}\tgrad: {p.grad.numel()}")
                         group = self._p_to_group[p]
                         self._group_counts[group] += 1
                         if self._group_counts[group] == len(group):

@@ -2,6 +2,7 @@
 #include <torch/torch.h>
 #include <torch/extension.h>
 #include <algorithm>
+#include <cmath>
 
 using namespace std;
 
@@ -9,7 +10,8 @@ namespace torch {
 
 vector<::torch::Tensor> _tensor_clipping_cpp(::torch::Tensor& tensor, const int _splitting_size){
     auto numel = tensor.numel();
-    int64_t chunks = numel / _splitting_size + 1;
+    // int64_t chunks = numel / _splitting_size + 1;
+    int64_t chunks = ceil((double)numel / (double)_splitting_size);
     return ::torch::chunk(tensor, chunks);
 }
 
