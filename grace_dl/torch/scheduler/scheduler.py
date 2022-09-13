@@ -38,7 +38,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         self._model = model
         self._opt = hvd_opt
         self._scheduler = True
-        self._enable_group = False
+        self._enable_group = True
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.debug(" size {}, rank {}".format(size(), rank()))
@@ -232,10 +232,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         # for p, value in self._handles.items():
         #     print(f"NAME: {self._get_parameter_name(p)}\tsplit_cnt: {self._splitting_cnt.get(p)}\thandles_size: {len(value[0])}")
 
-        missing_p = self._requires_update - set(self._handles.keys())
-        for p in missing_p:
-            handles, ctx = self._instant_allreduce_grad_async(p)
-            self._handles[p] = (handles, ctx, True)
+        # missing_p = self._requires_update - set(self._handles.keys())
+        # for p in missing_p:
+        #     handles, ctx = self._instant_allreduce_grad_async(p)
+        #     self._handles[p] = (handles, ctx, True)
 
         for p, value in self._handles.items():
             handles, ctx, enqueued = value
@@ -303,6 +303,11 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for handle in handles:
                 ready_for_aggregation &= poll(handle)
             if ready_for_aggregation:
+                # self._logger.debug("{} {} finished transmitting as single or splitted".format(self._desc, self._get_parameter_name(p)))
+                if len(handles) > 1:
+                    self._logger.debug("{} {} finished transmitting as splitted".format(self._desc, self._get_parameter_name(p)))
+                else:
+                    self._logger.debug("{} {} finished transmitting as single".format(self._desc, self._get_parameter_name(p)))
                 outputs = []
                 for handle in handles:
                     outputs.append(synchronize(handle))
@@ -322,6 +327,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             if handle is not None:
                 outputs = synchronize(handle)
                 for gp, output, ctx in zip(p, outputs, ctxs):
+                    self._logger.debug("{} {} finished transmitting as group".format(self._desc, self._get_parameter_name(p[0])))
                     self._allreduce_delay[gp] = self.backward_passes_per_step
                     gp.grad.set_(self._compression.decompress(output, ctx))
                     self._update_gradient(gp)
@@ -403,9 +409,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     p_groups.append([p for p in group if id(p) in p_list_ids])
                     for p in p_groups[-1]:
                         grouped_id.add(id(p))
-                for p in p_list:
-                    if id(p) not in grouped_id:
-                        p_groups.append([p])
+                # for p in p_list:
+                #     if id(p) not in grouped_id:
+                #         p_groups.append([p])
             else:
                 p_groups = split_list(p_list, self._groups)
 
@@ -638,7 +644,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
 
 def _init_bsc():
