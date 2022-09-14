@@ -137,22 +137,21 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     def _construct_template(self):
         template = {}
-        layers = dict(self._model.named_children())
-        ps = dict(self._model.named_parameters())
-        for layer in layers:
-            tensors_to_converge = []
-            tensors_to_split = []
-            for p_name, p in ps.items():
-                p_layer = p_name.split('.')[0]
-                if p_layer == layer:
-                    if p.numel() > self._splitting_size:
-                        tensors_to_split.append(p)
-                        # print(f"Split: {self._get_parameter_name(p)}\tsize: {p.numel()}")
-                    else:
-                        tensors_to_converge.append(p)
-                        # print(f"Conve: {self._get_parameter_name(p)}\tsize: {p.numel()}")
-            template[layer] = (tensors_to_converge, tensors_to_split)
-        # template = {list(ps.keys())[0]:(list(self._model.parameters()), [])}
+        modules = dict(self._model.named_modules())
+        layer = 0
+        for module_name, module in modules.items():
+            layer += 1
+            if layer < 5:
+                continue
+            tensors = list(module.parameters())
+            tensor_to_split = []
+            tensor_to_aggre = []
+            for t in tensors:
+                if t.numel() > self._splitting_size:
+                    tensor_to_split.append(t)
+                else :
+                    tensor_to_aggre.append(t)
+            template[module_name] = [tensor_to_aggre, tensor_to_split]
         return template
 
     """Actual API for user to call during training process"""
@@ -212,10 +211,10 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     def _synchronize(self):
         """Allreduce missing parameters"""
-        if self._scheduler:
-            self._logger.debug(
-                "{} Backward time model: {}".format(self._desc, self._time_model))
-            self._time_model = []
+        # if self._scheduler:
+        #     self._logger.debug(
+        #         "{} Backward time model: {}".format(self._desc, self._time_model))
+        #     self._time_model = []
         while not self._tensor_cache.empty():
             p, tensor, name, ctx = self._tensor_cache.get()
             handle = allreduce_async_(tensor, name=name, op=self.op,
@@ -228,10 +227,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             else:
                 self._handles[p] = ([handle], ctx, True)
 
-        # DEBUG
-        # for p, value in self._handles.items():
-        #     print(f"NAME: {self._get_parameter_name(p)}\tsplit_cnt: {self._splitting_cnt.get(p)}\thandles_size: {len(value[0])}")
-
         # missing_p = self._requires_update - set(self._handles.keys())
         # for p in missing_p:
         #     handles, ctx = self._instant_allreduce_grad_async(p)
@@ -241,7 +236,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             handles, ctx, enqueued = value
             if handles is None and not enqueued:
                 handles, ctx = self._instant_allreduce_grad_async(p)
-                self._logger.debug("None handle occures at {}!".format(
+                self._logger.error("None handle occures at {}!".format(
                     self._get_parameter_name(p)))
                 self._handles[p] = (handles, ctx, True)
         for p, value in self._handles.items():
@@ -264,7 +259,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
-        self._logger.debug("{} calls instant allreduce_async_ for {}".format(
+        self._logger.warning("{} calls instant allreduce_async_ for {}".format(
             self._desc, self._get_parameter_name(p)))
         return [handle], ctx
 
@@ -303,7 +298,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for handle in handles:
                 ready_for_aggregation &= poll(handle)
             if ready_for_aggregation:
-                # self._logger.debug("{} {} finished transmitting as single or splitted".format(self._desc, self._get_parameter_name(p)))
                 if len(handles) > 1:
                     self._logger.debug("{} {} finished transmitting as splitted".format(self._desc, self._get_parameter_name(p)))
                 else:
@@ -313,8 +307,6 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     outputs.append(synchronize(handle))
                 aggregated_tensor = self._tensor_aggregation(p, outputs)
                 p.grad.set_(self._compression.decompress(aggregated_tensor, ctx))
-                self._logger.debug("{} {} finished allreduce".format(
-                    self._desc, self._get_parameter_name(p)))
                 self._allreduce_delay[p] = self.backward_passes_per_step
                 self._update_gradient(p)
                 if p in self._locks:
@@ -327,7 +319,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             if handle is not None:
                 outputs = synchronize(handle)
                 for gp, output, ctx in zip(p, outputs, ctxs):
-                    self._logger.debug("{} {} finished transmitting as group".format(self._desc, self._get_parameter_name(p[0])))
+                    self._logger.debug("p: {}, outputs: {} ctxs: {}".format(len(p), len(outputs), len(ctxs)))
+                    self._logger.debug("{} {} finished transmitting as group".format(self._desc, self._get_parameter_name(gp)))
                     self._allreduce_delay[gp] = self.backward_passes_per_step
                     gp.grad.set_(self._compression.decompress(output, ctx))
                     self._update_gradient(gp)
@@ -337,7 +330,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                 for gp in p:
                     if gp in self._locks:
                         self._locks[gp].release()
-                    self._logger.warning("{} {} triggers forward propagation before synchronization".format(
+                    self._logger.error("{} {} triggers forward propagation before synchronization".format(
                         self._desc, self._get_parameter_name(p)))
             return True
 
@@ -459,13 +452,18 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
                     self._logger.debug("{} {} waits for {}".format(
                         self._desc, self._get_parameter_name(p), time_end_polling - time_start_polling))
                 elif self._p_to_group.get(p) in self._handles:
+                    time_start_polling = time.perf_counter()
                     self._poll_in_hook(self._p_to_group.get(p))
+                    time_end_polling = time.perf_counter()
+                    self._logger.debug("{} {} waits for {}".format(
+                        self._desc, self._get_parameter_name(p), time_end_polling - time_start_polling))
                     del self._handles[self._p_to_group.get(p)]
                 if p not in self._locks:
                     continue
                 with self._locks[p]:
-                    self._logger.debug("{} {} is ready.".format(
-                        self._desc, self._get_parameter_name(p)))
+                    pass
+                    # self._logger.debug("{} {} is ready.".format(
+                    #     self._desc, self._get_parameter_name(p)))
             self._logger.debug("{} starts forward {}.".format(self._desc, mod))
 
         def after_forward_hook(mod, input, result):
@@ -644,7 +642,7 @@ def _init_logger():
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.propagate = False
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 
 def _init_bsc():
