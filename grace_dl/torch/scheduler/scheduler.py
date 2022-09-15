@@ -1,4 +1,3 @@
-from posixpath import split
 import threading
 import logging
 
@@ -64,13 +63,9 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             self._groups = [cons 
                                 for (cons, __) in self._scheduler_template.values()
                            ] if self._enable_group else None
-            # for cons in self._groups:
-            #     for p in cons:
-            #         print(f"Name: {self._get_parameter_name(p)}\tSize: {p.numel()}")
             self._groups_names = [self._get_parameter_name(p) 
                                     for param in self._groups for p in param
                                  ] if self._enable_group else None
-            # print(self._groups_names)
 
         self._step = 0
         self._forward_step = 0
@@ -115,6 +110,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     def _update_gradient(self, p):
         # So only support SGD, Adam and RMSprop optimizers in torch
+        # start = time.perf_counter()
         if isinstance(self._opt, torch.optim.SGD):
             self._sgd(p)
         elif isinstance(self._opt, torch.optim.Adam):
@@ -124,6 +120,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         else:
             raise ValueError(
                 "Invalid optimizer! Only support SGD, Adam and RMSprop.")
+        # end = time.perf_counter()
+        # self._logger.debug("{} spent {} in updating {}".format(self._desc, end-start, self._get_parameter_name(p)))
         self._zero_one_grad(p)
 
     def _zero_one_grad(self, p):
@@ -160,8 +158,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         """Override the default zero_grad function.
         Clears the gradients of all optimized tensors.
         """
-        self._logger.debug(
-            "{} calls zero_grad() of step {}".format(self._desc, self._step))
+        # self._logger.debug(
+        #     "{} calls zero_grad() of step {}".format(self._desc, self._step))
         if size() > 1 and self._step > 0:
             return
         else:
@@ -195,14 +193,19 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             to split tensor into multiple tensors based on SIZE.
             Each split tensor has its own handle.
             split tensors will be aggregated in _completion_poll()"""
-        tensor = tensor.flatten()
-        tensors = _backend._tensor_clipping_cpp(tensor, self._splitting_size)
-        ts = [(tensor, i) for tensor, i in zip(tensors, range(len(tensors)))]
+        if tensor.numel() <= self._splitting_size:
+            ts = [(tensor, 0)]
+        else:
+            tensor = tensor.flatten()
+            tensors = _backend._tensor_clipping_cpp(tensor, self._splitting_size)
+            ts = [(tensor, i) for tensor, i in zip(tensors, range(len(tensors)))]
         return ts
 
     """TODO: Consider alter out-of-place reshape to in-place"""
 
     def _tensor_aggregation(self, p, split_tensors):
+        if p.grad.numel() <= self._splitting_size:
+            return split_tensors[0]
         shape = p.grad.shape
         agg_tensor = torch.cat(split_tensors, 0)
         return agg_tensor.view(shape)
@@ -215,6 +218,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         #     self._logger.debug(
         #         "{} Backward time model: {}".format(self._desc, self._time_model))
         #     self._time_model = []
+        start = time.perf_counter()
         while not self._tensor_cache.empty():
             p, tensor, name, ctx = self._tensor_cache.get()
             handle = allreduce_async_(tensor, name=name, op=self.op,
@@ -244,6 +248,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             if isinstance(p, tuple):
                 if self._scheduler and self._groups is not None and self._group_counts[p] != 0:
                     self._group_counts[p] = 0
+        end = time.perf_counter()
+        self._logger.debug("{} spent {} in _synchronize".format(self._desc, end-start))
 
     def _grouped_allreduce_grad_async(self, ps):
         name = self._parameter_names.get(ps[0])
@@ -259,7 +265,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         handle = allreduce_async_(tensor_compressed, name=name, op=self.op,
                                   prescale_factor=self.prescale_factor,
                                   postscale_factor=self.postscale_factor)
-        self._logger.warning("{} calls instant allreduce_async_ for {}".format(
+        self._logger.debug("{} calls instant allreduce_async_ for {}".format(
             self._desc, self._get_parameter_name(p)))
         return [handle], ctx
 
@@ -289,37 +295,40 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         return handles, ctx
 
     def _poll_in_hook(self, p):
-        if not isinstance(p, tuple):
+        if not self._scheduler:
             handles, ctx, _ = self._handles.get(p)
-            if self._step > 1 and len(handles) != self._splitting_cnt.get(p):
-                # print(f"step: {self._step}\thandles: {len(handles)}\tcnt: {self._splitting_cnt.get(p)}\tname: {self._get_parameter_name(p)}\tnumel: {p.grad.numel()}")
-                return False
-            ready_for_aggregation = True
+            self._logger.debug(
+                "{} {} finished transmitting as {}".format(self._desc, self._get_parameter_name(p), 'single'))
+            p.grad.set_(self._compression.decompress(synchronize(handles[0]), ctx))
+            self._allreduce_delay[p] = self.backward_passes_per_step
+            self._update_gradient(p)
+            if p in self._locks:
+                self._locks[p].release()
+            return
+        if not isinstance(p, tuple):
+            while True:
+                handles, ctx, _ = self._handles.get(p)
+                if self._step <= 1 or len(handles) == self._splitting_cnt.get(p):
+                    break
+            outputs = []
             for handle in handles:
-                ready_for_aggregation &= poll(handle)
-            if ready_for_aggregation:
-                if len(handles) > 1:
-                    self._logger.debug("{} {} finished transmitting as splitted".format(self._desc, self._get_parameter_name(p)))
-                else:
-                    self._logger.debug("{} {} finished transmitting as single".format(self._desc, self._get_parameter_name(p)))
-                outputs = []
-                for handle in handles:
-                    outputs.append(synchronize(handle))
-                aggregated_tensor = self._tensor_aggregation(p, outputs)
-                p.grad.set_(self._compression.decompress(aggregated_tensor, ctx))
-                self._allreduce_delay[p] = self.backward_passes_per_step
-                self._update_gradient(p)
-                if p in self._locks:
-                    self._locks[p].release()
-                return True
-            else:
-                return False
+                outputs.append(synchronize(handle))
+            self._logger.debug(
+                "{} {} finished transmitting as {}".format(
+                        self._desc, self._get_parameter_name(p), 
+                        'splitted' if len(handles) > 1 else 'single'))
+            aggregated_tensor = self._tensor_aggregation(p, outputs)
+            p.grad.set_(self._compression.decompress(aggregated_tensor, ctx))
+            self._allreduce_delay[p] = self.backward_passes_per_step
+            self._update_gradient(p)
+            if p in self._locks:
+                self._locks[p].release()
         else:
             handle, ctxs, _ = self._handles.get(p)
             if handle is not None:
                 outputs = synchronize(handle)
                 for gp, output, ctx in zip(p, outputs, ctxs):
-                    self._logger.debug("p: {}, outputs: {} ctxs: {}".format(len(p), len(outputs), len(ctxs)))
+                    # self._logger.debug("p: {}, outputs: {} ctxs: {}".format(len(p), len(outputs), len(ctxs)))
                     self._logger.debug("{} {} finished transmitting as group".format(self._desc, self._get_parameter_name(gp)))
                     self._allreduce_delay[gp] = self.backward_passes_per_step
                     gp.grad.set_(self._compression.decompress(output, ctx))
@@ -445,8 +454,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
             for p in mod.parameters():
                 if p in self._handles:
                     time_start_polling = time.perf_counter()
-                    while not self._poll_in_hook(p):
-                        continue
+                    self._poll_in_hook(p)
                     del self._handles[p]
                     time_end_polling = time.perf_counter()
                     self._logger.debug("{} {} waits for {}".format(
