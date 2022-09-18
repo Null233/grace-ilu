@@ -36,8 +36,8 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
         self._model = model
         self._opt = hvd_opt
-        self._scheduler = True
-        self._enable_group = True
+        self._scheduler = False
+        self._enable_group = False
 
         self._logger = logging.getLogger("Scheduler")
         self._logger.debug(" size {}, rank {}".format(size(), rank()))
@@ -135,7 +135,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
     def _construct_template(self):
         template = {}
-        modules = dict(self._model.named_modules())
+        modules = dict(self._model.named_children())
         layer = 0
         for module_name, module in modules.items():
             layer += 1
@@ -235,14 +235,14 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
         # for p in missing_p:
         #     handles, ctx = self._instant_allreduce_grad_async(p)
         #     self._handles[p] = (handles, ctx, True)
+        # for p, value in self._handles.items():
+        #     handles, ctx, enqueued = value
+        #     if handles is None and not enqueued:
+        #         handles, ctx = self._instant_allreduce_grad_async(p)
+        #         self._logger.error("None handle occures at {}!".format(
+        #             self._get_parameter_name(p)))
+        #         self._handles[p] = (handles, ctx, True)
 
-        for p, value in self._handles.items():
-            handles, ctx, enqueued = value
-            if handles is None and not enqueued:
-                handles, ctx = self._instant_allreduce_grad_async(p)
-                self._logger.error("None handle occures at {}!".format(
-                    self._get_parameter_name(p)))
-                self._handles[p] = (handles, ctx, True)
         for p, value in self._handles.items():
             handles, ctx, enqueued = value
             if isinstance(p, tuple):
@@ -476,8 +476,7 @@ class _Scheduled_Optimizer(_DistributedOptimizer):
 
         def after_forward_hook(mod, input, result):
             pass
-            # self._logger.debug(
-            #     "{} finished forward {}.".format(self._desc, mod))
+
 
         # Register pre-hook and hook for each module
         for mod in reversed(submodules):
